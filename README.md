@@ -83,8 +83,29 @@ maturin develop --release        # always use --release for performance
 maturin build --release
 ```
 
-> Note: `.cargo/config.toml` sets `target-cpu=native` for AVX2/SIMD. This makes the wheel
-> non-portable to older CPUs; for distribution use `target-cpu=x86-64-v3` instead.
+The committed `.cargo/config.toml` uses **portable** CPU baselines (x86-64-v2 on x86;
+NEON on ARM) so the same build works everywhere. For a max-performance build on *your own*
+deployment machine, override with the native CPU (not portable — don't redistribute it):
+
+```bash
+RUSTFLAGS="-C target-cpu=native" maturin build --release
+```
+
+### Building for a specific ARM64 board
+
+To build a wheel tuned for one board (e.g. the **Radxa Dragon Q6A** / Qualcomm QCS6490,
+Cortex-A78+A55), use the helper script — it picks the right, non-portable CPU flags so you
+don't hand-edit anything:
+
+```bash
+./scripts/build-board.sh              # build a tuned wheel
+./scripts/build-board.sh develop      # ...or install into the current venv (on the board)
+TARGET_CPU=cortex-a76 ./scripts/build-board.sh   # override the CPU tuning
+```
+
+Built **on** the board it uses `target-cpu=native` (auto-detects the exact chip); run as a
+cross-compile it targets `cortex-a78`. These flags deliberately live in the script, *not* in
+`.cargo/config.toml`, so the published portable wheels stay CPU-agnostic.
 
 ## Usage
 

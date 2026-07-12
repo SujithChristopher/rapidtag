@@ -1,6 +1,7 @@
 //! fasttag — a pure-Rust port of OpenCV's aruco marker detection, exposed to
 //! Python via PyO3/maturin. v1: detectMarkers (CORNER_REFINE_NONE).
 
+mod contours;
 mod detector;
 #[allow(non_upper_case_globals)]
 mod dictionaries_data;

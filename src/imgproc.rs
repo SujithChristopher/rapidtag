@@ -33,8 +33,15 @@ pub fn to_gray(data: Vec<u8>, h: usize, w: usize, channels: usize) -> GrayImage 
 /// Adaptive threshold, ADAPTIVE_THRESH_MEAN_C + THRESH_BINARY_INV.
 /// For each pixel: T = mean(win x win neighbourhood) - c; out = src > T ? 0 : 255.
 /// Uses a clamped-window mean (border pixels divide by the true covered area).
-/// `parallel` row-parallelizes the compare loop (use for single-frame; leave off
-/// when the caller already parallelizes across frames).
+///
+/// Computed with an O(1)-per-pixel sliding box sum instead of a full integral
+/// image: a running per-column vertical sum (`colsum`, one row wide) advanced down
+/// the image, then a running horizontal sum across it. This keeps the working set
+/// to ~one row (a few KB, cache-resident) instead of a multi-MB integral table.
+///
+/// `parallel` splits the rows into independent bands (each seeds its own `colsum`
+/// from scratch). Because the sliding sum is low-bandwidth, this scales well —
+/// unlike the old integral-image threshold, which was bandwidth bound.
 pub fn adaptive_threshold_mean_inv(src: &GrayImage, mut win: u32, c: f64, parallel: bool) -> GrayImage {
     if win < 3 {
         win = 3;
@@ -42,61 +49,104 @@ pub fn adaptive_threshold_mean_inv(src: &GrayImage, mut win: u32, c: f64, parall
     if win % 2 == 0 {
         win += 1;
     }
-    let (w, h) = (src.width() as i64, src.height() as i64);
-    let radius = (win / 2) as i64;
+    let w = src.width() as usize;
+    let h = src.height() as usize;
+    let radius = (win / 2) as usize;
     let sp = src.as_raw();
-
-    // Integral image (w+1)x(h+1). i32 holds sums up to 255*W*H (~2.1e9), which
-    // covers images up to ~8.4 MP — well beyond typical marker-detection frames.
-    let iw = (w + 1) as usize;
-    let ih = (h + 1) as usize;
-    let mut integral = vec![0i32; iw * ih];
-    for y in 0..h as usize {
-        let mut row_sum = 0i32;
-        let row = &sp[y * w as usize..(y + 1) * w as usize];
-        let (head, tail) = integral.split_at_mut((y + 1) * iw);
-        let prev = &head[y * iw..(y + 1) * iw];
-        let dst = &mut tail[0..iw];
-        for x in 0..w as usize {
-            row_sum += row[x] as i32;
-            dst[x + 1] = prev[x + 1] + row_sum;
-        }
-    }
-    // Integer form of `src > round(mean) - C`, with mean = sum/area:
-    //   dst=0  ⟺  src > floor(sum/area + 0.5) - C  ⟺  2*sum + area < 2*area*(src + C)
-    // No per-pixel division → autovectorizes under target-cpu=native.
     let c_int = c as i32;
-    let wu = w as usize;
-    let mut out = vec![0u8; wu * h as usize];
 
-    // Per-output-row compare against the integral image (read-only, shared).
-    let compute_row = |y: i64, out_row: &mut [u8]| {
-        let y0 = (y - radius).max(0);
-        let y1 = (y + radius).min(h - 1);
-        let yspan = (y1 - y0 + 1) as i32;
-        let iy0 = y0 as usize * iw;
-        let iy1 = (y1 + 1) as usize * iw;
-        let sp_row = &sp[(y * w) as usize..(y * w) as usize + wu];
-        for x in 0..wu {
-            let xi = x as i64;
-            let x0 = (xi - radius).max(0) as usize;
-            let x1 = (xi + radius).min(w - 1) as usize;
-            let area = (x1 - x0 + 1) as i32 * yspan;
-            let sum = integral[iy1 + x1 + 1] - integral[iy0 + x1 + 1] - integral[iy1 + x0]
-                + integral[iy0 + x0];
-            let v = sp_row[x] as i32;
-            out_row[x] = if 2 * sum + area < 2 * area * (v + c_int) { 0u8 } else { 255u8 };
+    let mut out = vec![0u8; w * h];
+
+    // Fill output rows [r0, r0+nrows) using a from-scratch seeded sliding window.
+    let process_band = |out_band: &mut [u8], r0: usize| {
+        let row_at = |y: usize| &sp[y * w..y * w + w];
+        let nrows = out_band.len() / w;
+
+        // seed colsum for the first output row of the band
+        let mut cur_top = r0.saturating_sub(radius);
+        let mut cur_bot = (r0 + radius).min(h - 1);
+        let mut colsum = vec![0i32; w];
+        for yy in cur_top..=cur_bot {
+            let r = row_at(yy);
+            for x in 0..w {
+                colsum[x] += r[x] as i32;
+            }
+        }
+
+        // hpre[x] = prefix sum of colsum (hpre[0]=0, len w+1), reused per row.
+        let mut hpre = vec![0i32; w + 1];
+        // interior column span [lo, hi) where the full window fits: x-radius>=0 and x+radius<=w-1
+        let lo = radius.min(w);
+        let hi = w.saturating_sub(radius).max(lo);
+
+        for i in 0..nrows {
+            let y = r0 + i;
+            let target_bot = (y + radius).min(h - 1);
+            while cur_bot < target_bot {
+                cur_bot += 1;
+                let r = row_at(cur_bot);
+                for x in 0..w {
+                    colsum[x] += r[x] as i32;
+                }
+            }
+            let target_top = y.saturating_sub(radius);
+            while cur_top < target_top {
+                let r = row_at(cur_top);
+                for x in 0..w {
+                    colsum[x] -= r[x] as i32;
+                }
+                cur_top += 1;
+            }
+            let yspan = (cur_bot - cur_top + 1) as i32;
+
+            // 1D prefix of colsum so any window sum is a difference of two entries.
+            let mut acc = 0i32;
+            for x in 0..w {
+                acc += colsum[x];
+                hpre[x + 1] = acc;
+            }
+
+            let out_row = &mut out_band[i * w..i * w + w];
+            let src_row = row_at(y);
+            // integer compare: dst=0 ⟺ 2*sum + area < 2*area*(src + C)
+
+            // border-left columns (partial window) — scalar
+            for x in 0..lo {
+                let x1 = (x + radius).min(w - 1);
+                let sum = hpre[x1 + 1]; // hpre[0] == 0
+                let area = (x1 + 1) as i32 * yspan;
+                let v = src_row[x] as i32;
+                out_row[x] = if 2 * sum + area < 2 * area * (v + c_int) { 0 } else { 255 };
+            }
+
+            // interior columns (full window: constant area) — branchless, vectorizable
+            let area = (2 * radius + 1) as i32 * yspan;
+            let two_area = 2 * area;
+            for x in lo..hi {
+                let sum = hpre[x + radius + 1] - hpre[x - radius];
+                let v = src_row[x] as i32;
+                out_row[x] = if 2 * sum + area < two_area * (v + c_int) { 0 } else { 255 };
+            }
+
+            // border-right columns (partial window) — scalar
+            for x in hi..w {
+                let x0 = x - radius;
+                let sum = hpre[w] - hpre[x0];
+                let area = (w - x0) as i32 * yspan;
+                let v = src_row[x] as i32;
+                out_row[x] = if 2 * sum + area < 2 * area * (v + c_int) { 0 } else { 255 };
+            }
         }
     };
 
     if parallel {
-        out.par_chunks_mut(wu)
+        let nbands = rayon::current_num_threads().max(1).min(h.max(1));
+        let band_rows = h.div_ceil(nbands);
+        out.par_chunks_mut(band_rows * w)
             .enumerate()
-            .for_each(|(y, row)| compute_row(y as i64, row));
+            .for_each(|(b, chunk)| process_band(chunk, b * band_rows));
     } else {
-        out.chunks_mut(wu)
-            .enumerate()
-            .for_each(|(y, row)| compute_row(y as i64, row));
+        process_band(&mut out, 0);
     }
     GrayImage::from_raw(w as u32, h as u32, out).expect("threshold buffer size")
 }

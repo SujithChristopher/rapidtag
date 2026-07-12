@@ -1,9 +1,9 @@
 //! Port of the cv::aruco::ArucoDetector::detectMarkers pipeline (CORNER_REFINE_NONE).
 
+use crate::contours::for_each_contour;
 use crate::dictionary::{Dictionary, DEFAULT_VALID_BIT_ID_THRESHOLD};
 use crate::imgproc::{self, Pt};
 use image::GrayImage;
-use imageproc::contours::find_contours;
 use rayon::prelude::*;
 
 #[derive(Clone)]
@@ -70,21 +70,20 @@ fn find_marker_contours(thresh: &GrayImage, p: &DetectorParameters) -> Vec<Quad>
     }
 
     let mut out = Vec::new();
-    let contours = find_contours::<i32>(thresh);
-    for contour in contours {
-        let n = contour.points.len();
+    let mut pts: Vec<Pt> = Vec::new(); // reused f32 buffer
+    // Trace + filter fused: most contours are tiny noise and are rejected by the
+    // size test before we ever allocate for them.
+    for_each_contour(thresh, |contour| {
+        let n = contour.len();
         if n < min_perimeter || n > max_perimeter {
-            continue;
+            return;
         }
-        let pts: Vec<Pt> = contour
-            .points
-            .iter()
-            .map(|pt| (pt.x as f32, pt.y as f32))
-            .collect();
+        pts.clear();
+        pts.extend(contour.iter().map(|&(x, y)| (x as f32, y as f32)));
         let eps = (n as f64 * p.polygonal_approx_accuracy_rate) as f32;
         let approx = imgproc::approx_poly_dp_closed(&pts, eps);
         if approx.len() != 4 || !imgproc::is_convex(&approx) {
-            continue;
+            return;
         }
         // min distance between corners
         let mut min_dist_sq = (max_wh * max_wh) as f32;
@@ -96,10 +95,10 @@ fn find_marker_contours(thresh: &GrayImage, p: &DetectorParameters) -> Vec<Quad>
         }
         let min_corner = (n as f64 * p.min_corner_distance_rate) as f32;
         if min_dist_sq < min_corner * min_corner {
-            continue;
+            return;
         }
         out.push([approx[0], approx[1], approx[2], approx[3]]);
-    }
+    });
     out
 }
 
@@ -334,9 +333,22 @@ fn n_scales(p: &DetectorParameters) -> i32 {
 }
 
 /// Candidate quads found at one threshold scale (STEP 1 for a single scale).
-fn candidates_for_scale(gray: &GrayImage, p: &DetectorParameters, scale_i: i32) -> Vec<Quad> {
+/// `parallel_threshold` parallelizes the integral+compare internally; use it when
+/// scales are computed sequentially (single frame), off when the caller already
+/// parallelizes across frames/scales (batch).
+fn candidates_for_scale(
+    gray: &GrayImage,
+    p: &DetectorParameters,
+    scale_i: i32,
+    parallel_threshold: bool,
+) -> Vec<Quad> {
     let win = p.adaptive_thresh_win_size_min + scale_i * p.adaptive_thresh_win_size_step;
-    let thresh = imgproc::adaptive_threshold_mean_inv(gray, win as u32, p.adaptive_thresh_constant, false);
+    let thresh = imgproc::adaptive_threshold_mean_inv(
+        gray,
+        win as u32,
+        p.adaptive_thresh_constant,
+        parallel_threshold,
+    );
     find_marker_contours(&thresh, p)
 }
 
@@ -377,7 +389,7 @@ pub fn detect_markers(
 ) -> (Vec<Detection>, Vec<Quad>) {
     let per_scale: Vec<Vec<Quad>> = (0..n_scales(p))
         .into_par_iter()
-        .map(|i| candidates_for_scale(gray, p, i))
+        .map(|i| candidates_for_scale(gray, p, i, false))
         .collect();
     let candidates: Vec<Quad> = per_scale.into_iter().flatten().collect();
     finalize(gray, candidates, dict, p)
@@ -401,7 +413,7 @@ pub fn detect_markers_multi(
         .collect();
     let partial: Vec<Vec<Quad>> = work
         .par_iter()
-        .map(|&(f, s)| candidates_for_scale(&grays[f], p, s))
+        .map(|&(f, s)| candidates_for_scale(&grays[f], p, s, false))
         .collect();
 
     // Regroup candidates per frame (partial is in the same (frame, scale) order).

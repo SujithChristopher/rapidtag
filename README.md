@@ -1,5 +1,11 @@
 # RapidTag
 
+> ⚠️ **Work in progress — not production-ready.** RapidTag is under active development
+> and pre-1.0. APIs, behavior, and results may change without notice, and it has not been
+> hardened or battle-tested for production use. Use it for research, evaluation, and
+> prototyping, and validate it thoroughly against your own data before relying on it for
+> anything critical.
+
 **Fast, pure-Rust fiducial marker detection for realtime.** RapidTag is a from-scratch
 Rust reimplementation of OpenCV's ArUco / AprilTag marker detector, exposed to Python
 via [maturin](https://www.maturin.rs/) / [PyO3](https://pyo3.rs/) — **no OpenCV runtime

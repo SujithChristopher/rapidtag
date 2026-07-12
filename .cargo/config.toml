@@ -1,10 +1,18 @@
-# Portable SIMD baseline for distributed wheels.
+# Portable SIMD baseline for distributed wheels — multi-architecture aware.
+#
+# This section is keyed on target ARCHITECTURE (not OS), so a single rule covers
+# every x86_64 target regardless of platform: Linux x86_64, macOS Intel, and
+# Windows x64 all get `target-cpu=x86-64-v2`. (`target-cpu` is an LLVM flag,
+# identical across OSes and toolchains, including MSVC.)
 #
 # x86-64-v2 = SSE4.2 / POPCNT, supported by essentially every x86-64 CPU since
 # ~2009. It still enables 128-bit SIMD autovectorization (keeps most of our
-# threshold speedup) while remaining safe to run anywhere. Applied only to
-# x86_64; aarch64 (Apple Silicon, ARM servers) uses its NEON baseline, which is
-# always present, so no flag is needed there.
+# threshold speedup) while remaining safe to run anywhere.
+#
+# aarch64 targets (macOS Apple Silicon, ARM Linux servers, Raspberry Pi 64,
+# Jetson) do NOT match this cfg, so they fall back to the default ARMv8 NEON
+# baseline — which is always present. This is intentional: a global x86-64-v2
+# would be an invalid CPU for ARM and break those builds.
 #
 # For a MAX-PERFORMANCE build on your own deployment machine, override with the
 # native CPU (not portable — do not ship the resulting wheel):

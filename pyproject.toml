@@ -12,7 +12,7 @@ license = "Apache-2.0"
 authors = [{ name = "Sujith Christopher", email = "sujith.christopher52@gmail.com" }]
 keywords = ["aruco", "apriltag", "fiducial", "marker", "detection", "computer-vision", "realtime", "rust"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Image Recognition",
     "Programming Language :: Rust",

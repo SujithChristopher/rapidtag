@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "rapidtag"
-version = "0.1.0"
+version = "0.1.1"
 description = "RapidTag — fast realtime fiducial marker (ArUco/AprilTag) detection in Rust"
 readme = "README.md"
 requires-python = ">=3.9"

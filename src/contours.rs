@@ -52,7 +52,16 @@ pub fn for_each_contour<F: FnMut(&[(i32, i32)])>(thresh: &GrayImage, mut f: F) {
         return;
     }
     let stride = (w + 2) as usize;
-    let mut lbl = vec![0i32; stride * (h + 2) as usize];
+    // Label alphabet (i8, not i32): the Suzuki-Abe NBD *magnitude* is only used for
+    // hierarchy, which the aruco pipeline discards — so we never need distinct
+    // per-contour ids, only to mark visited pixels and keep the +/- sign that the
+    // border-start test relies on. Collapsing to {0,1,POS,NEG} shrinks this buffer
+    // 4x (the dominant cost is streaming it, not the tracing), and it's the same
+    // buffer we scan and binarize into every frame.
+    const FG: i8 = 1; // unlabeled foreground
+    const POS: i8 = 2; // traced, positive (interior-capable)
+    const NEG: i8 = -2; // traced, negative (right edge)
+    let mut lbl = vec![0i8; stride * (h + 2) as usize];
     let src = thresh.as_raw();
 
     // padded index for a real coordinate; valid for x in [-1, w], y in [-1, h]
@@ -64,32 +73,36 @@ pub fn for_each_contour<F: FnMut(&[(i32, i32)])>(thresh: &GrayImage, mut f: F) {
         let base = (y + 1) as usize * stride + 1;
         for x in 0..w as usize {
             if row[x] > 0 {
-                lbl[base + x] = 1;
+                lbl[base + x] = FG;
             }
         }
     }
 
     let max_points = (w as usize) * (h as usize) + 1; // hang guard
     let mut points: Vec<(i32, i32)> = Vec::new(); // reused across contours
-    let mut nbd = 1i32;
 
     for y in 0..h {
-        for x in 0..w {
-            let v = lbl[idx(x, y)];
+        // Row base for real x=0. The 1px pad guarantees `row_base-1` and
+        // `row_base + (w-1) + 1` are in-bounds, so left/right neighbours need no
+        // edge test. Reading a contiguous row slice lets the zero-skip vectorize.
+        let row_base = (y + 1) as usize * stride + 1;
+        for x in 0..w as usize {
+            let v = lbl[row_base + x];
             if v == 0 {
                 continue;
             }
             // border start: outer (unlabeled fg with background to the left) or
-            // hole (fg with background to the right)
-            let adj = if v == 1 && x > 0 && lbl[idx(x - 1, y)] == 0 {
-                (x - 1, y)
-            } else if v > 0 && x + 1 < w && lbl[idx(x + 1, y)] == 0 {
-                (x + 1, y)
+            // hole (fg with background to the right). The x>0 / x+1<w guards match
+            // imageproc exactly — the image edge itself is NOT treated as a
+            // background neighbour here, so we cannot lean on the zero pad.
+            let adj = if v == FG && x > 0 && lbl[row_base + x - 1] == 0 {
+                (x as i32 - 1, y)
+            } else if v > 0 && x + 1 < w as usize && lbl[row_base + x + 1] == 0 {
+                (x as i32 + 1, y)
             } else {
                 continue;
             };
-            nbd += 1;
-            let curr = (x, y);
+            let curr = (x as i32, y);
 
             // pos1: first non-zero neighbor, searching clockwise from `adj`
             let d0 = dir_index((adj.0 - curr.0, adj.1 - curr.1));
@@ -106,8 +119,8 @@ pub fn for_each_contour<F: FnMut(&[(i32, i32)])>(thresh: &GrayImage, mut f: F) {
             match pos1 {
                 None => {
                     // isolated pixel
-                    points.push((x, y));
-                    lbl[idx(x, y)] = -nbd;
+                    points.push(curr);
+                    lbl[row_base + x] = NEG;
                 }
                 Some(pos1) => {
                     let mut pos2 = pos1;
@@ -141,9 +154,9 @@ pub fn for_each_contour<F: FnMut(&[(i32, i32)])>(thresh: &GrayImage, mut f: F) {
                         }
 
                         if pos3.0 + 1 == w || is_right_edge {
-                            lbl[idx(pos3.0, pos3.1)] = -nbd;
-                        } else if lbl[idx(pos3.0, pos3.1)] == 1 {
-                            lbl[idx(pos3.0, pos3.1)] = nbd;
+                            lbl[idx(pos3.0, pos3.1)] = NEG;
+                        } else if lbl[idx(pos3.0, pos3.1)] == FG {
+                            lbl[idx(pos3.0, pos3.1)] = POS;
                         }
 
                         if pos4 == curr && pos3 == pos1 {

@@ -1,0 +1,5 @@
+# Optimize for the build machine's CPU (enables AVX2/AVX-512 where available).
+# NOTE: the resulting binary is not portable to older CPUs. For distributable
+# wheels use a baseline like target-feature=+avx2 or target-cpu=x86-64-v3.
+[build]
+rustflags = ["-C", "target-cpu=native"]

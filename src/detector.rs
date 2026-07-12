@@ -328,56 +328,92 @@ pub struct Detection {
 /// for single-frame calls; disable it when the caller already parallelizes across
 /// frames (batch mode) to avoid nested-rayon oversubscription. Output is identical
 /// either way — scale results are always concatenated in scale order.
-pub fn detect_markers(
+fn n_scales(p: &DetectorParameters) -> i32 {
+    (p.adaptive_thresh_win_size_max - p.adaptive_thresh_win_size_min) / p.adaptive_thresh_win_size_step
+        + 1
+}
+
+/// Candidate quads found at one threshold scale (STEP 1 for a single scale).
+fn candidates_for_scale(gray: &GrayImage, p: &DetectorParameters, scale_i: i32) -> Vec<Quad> {
+    let win = p.adaptive_thresh_win_size_min + scale_i * p.adaptive_thresh_win_size_step;
+    let thresh = imgproc::adaptive_threshold_mean_inv(gray, win as u32, p.adaptive_thresh_constant, false);
+    find_marker_contours(&thresh, p)
+}
+
+/// STEP 2 + 3: reorder, drop near-duplicates, identify. `candidates` must already
+/// be concatenated in scale order to match OpenCV's output.
+fn finalize(
     gray: &GrayImage,
+    mut candidates: Vec<Quad>,
     dict: &Dictionary,
     p: &DetectorParameters,
-    parallel_scales: bool,
 ) -> (Vec<Detection>, Vec<Quad>) {
     let (w, h) = (gray.width() as f32, gray.height() as f32);
-
-    // STEP 1: candidate detection over the range of threshold window sizes.
-    let n_scales = (p.adaptive_thresh_win_size_max - p.adaptive_thresh_win_size_min)
-        / p.adaptive_thresh_win_size_step
-        + 1;
-    let scale_work = |i: i32| {
-        let win = p.adaptive_thresh_win_size_min + i * p.adaptive_thresh_win_size_step;
-        let thresh =
-            imgproc::adaptive_threshold_mean_inv(gray, win as u32, p.adaptive_thresh_constant);
-        find_marker_contours(&thresh, p)
-    };
-    let per_scale: Vec<Vec<Quad>> = if parallel_scales {
-        (0..n_scales).into_par_iter().map(scale_work).collect()
-    } else {
-        (0..n_scales).map(scale_work).collect()
-    };
-    let mut candidates: Vec<Quad> = Vec::new();
-    for scale in per_scale {
-        candidates.extend(scale);
-    }
     for c in candidates.iter_mut() {
         reorder_corners(c);
     }
-
-    // STEP 2: filter near-duplicate candidates
     let selected = filter_too_close(&candidates, p, w, h);
 
-    // STEP 3: identify
     let mut detections = Vec::new();
     let mut rejected = Vec::new();
     for cand in selected {
         match identify_one(dict, gray, &cand, p) {
             Some((id, rotation)) => {
-                // correctCornerPosition: rotate so corner order matches the marker
                 let mut c = cand;
-                c.rotate_left((4 - rotation) % 4);
-                detections.push(Detection {
-                    corners: c,
-                    id: id as i32,
-                });
+                c.rotate_left((4 - rotation) % 4); // correctCornerPosition
+                detections.push(Detection { corners: c, id: id as i32 });
             }
             None => rejected.push(cand),
         }
     }
     (detections, rejected)
+}
+
+/// Detect markers in a single frame. The threshold scales run on separate cores.
+pub fn detect_markers(
+    gray: &GrayImage,
+    dict: &Dictionary,
+    p: &DetectorParameters,
+) -> (Vec<Detection>, Vec<Quad>) {
+    let per_scale: Vec<Vec<Quad>> = (0..n_scales(p))
+        .into_par_iter()
+        .map(|i| candidates_for_scale(gray, p, i))
+        .collect();
+    let candidates: Vec<Quad> = per_scale.into_iter().flatten().collect();
+    finalize(gray, candidates, dict, p)
+}
+
+/// Detect markers across many frames using flat (frame × scale) parallelism.
+///
+/// This one scheme is optimal at every batch size: 1 frame keeps the 3 scales on
+/// 3 cores, a dual-camera pair uses 6, and a large offline batch fills all cores —
+/// with no nested rayon. Output order and values match `detect_markers` per frame.
+pub fn detect_markers_multi(
+    grays: Vec<GrayImage>,
+    dict: &Dictionary,
+    p: &DetectorParameters,
+) -> Vec<(Vec<Detection>, Vec<Quad>)> {
+    let ns = n_scales(p);
+    // Flat work list ordered (frame, scale) with scale innermost, so per-frame
+    // results stay in scale order when regrouped.
+    let work: Vec<(usize, i32)> = (0..grays.len())
+        .flat_map(|f| (0..ns).map(move |s| (f, s)))
+        .collect();
+    let partial: Vec<Vec<Quad>> = work
+        .par_iter()
+        .map(|&(f, s)| candidates_for_scale(&grays[f], p, s))
+        .collect();
+
+    // Regroup candidates per frame (partial is in the same (frame, scale) order).
+    let mut per_frame: Vec<Vec<Quad>> = vec![Vec::new(); grays.len()];
+    for (idx, quads) in partial.into_iter().enumerate() {
+        per_frame[work[idx].0].extend(quads);
+    }
+
+    // Finalize each frame in parallel.
+    per_frame
+        .into_par_iter()
+        .zip(grays.into_par_iter())
+        .map(|(cands, gray)| finalize(&gray, cands, dict, p))
+        .collect()
 }

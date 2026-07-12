@@ -1,7 +1,10 @@
 """Benchmark fasttag vs OpenCV aruco on real OV9281 dual-cam frames.
 
-Reads frames through the msgpack + msgpack_numpy pipeline, runs both detectors,
-and reports throughput (FPS), latency, detection parity and corner agreement.
+Reads frames through the msgpack + msgpack_numpy pipeline and reports:
+  - single-frame latency (realtime, one camera)
+  - dual-camera pair latency (both cameras processed together via the batch API)
+  - offline batch throughput (all cores)
+  - detection parity and corner agreement vs OpenCV
 """
 import argparse
 import time
@@ -13,101 +16,72 @@ import fasttag
 
 DICT = "DICT_APRILTAG_36h11"
 CV_DICT = cv2.aruco.DICT_APRILTAG_36h11
+DATA = "data/dual_cam_single_aprl_50mm_t0"
 
 
-def frames(path, limit):
-    with open(path, "rb") as f:
+def load(cam, n):
+    with open(f"{DATA}/{cam}_frame.msgpack", "rb") as f:
         unp = msgpack.Unpacker(f, object_hook=mpn.decode, raw=False)
-        for i, obj in enumerate(unp):
-            if limit and i >= limit:
-                break
-            yield np.ascontiguousarray(obj)
+        return [np.ascontiguousarray(o) for _, o in zip(range(n), unp)]
 
 
-def corner_err(a, b):
-    a = np.asarray(a)
-    b = np.asarray(b).reshape(4, 2)
-    return min(np.abs(np.roll(a, k, axis=0) - b).max() for k in range(4))
+def lat_ms(fn, items):
+    out = []
+    for x in items:
+        t = time.perf_counter()
+        fn(x)
+        out.append((time.perf_counter() - t) * 1e3)
+    return np.array(out)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--path", default="data/dual_cam_single_aprl_50mm_t0/cam0_frame.msgpack")
-    ap.add_argument("--n", type=int, default=300, help="frames to process")
-    ap.add_argument("--warmup", type=int, default=10)
+    ap.add_argument("--n", type=int, default=400)
     args = ap.parse_args()
 
-    print(f"Loading up to {args.n} frames from {args.path} ...")
-    imgs = list(frames(args.path, args.n))
-    print(f"Loaded {len(imgs)} frames of {imgs[0].shape} {imgs[0].dtype}\n")
-
-    cv_detector = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(CV_DICT))
-
-    def run_fasttag(img):
-        c, i = fasttag.detect_markers(img, DICT)
-        return {int(k): np.array(v) for k, v in zip(i, c)}
-
-    def run_opencv(img):
-        c, i, _ = cv_detector.detectMarkers(img)
-        if i is None:
-            return {}
-        return {int(k): v.reshape(4, 2) for k, v in zip(i.flatten(), c)}
-
-    engines = {"fasttag": run_fasttag, "opencv": run_opencv}
+    c0 = load("cam0", args.n)
+    c1 = load("cam1", args.n)
+    print(f"Loaded {len(c0)}+{len(c1)} frames of {c0[0].shape}\n")
 
     # warmup
-    for img in imgs[: args.warmup]:
-        for fn in engines.values():
-            fn(img)
+    for im in c0[:20]:
+        fasttag.detect_markers(im, DICT)
+    fasttag.detect_markers_batch(c0[:8], DICT)
 
-    results = {}
-    per_frame_ids = {name: [] for name in engines}
-    for name, fn in engines.items():
-        latencies = []
-        t0 = time.perf_counter()
-        for img in imgs:
-            s = time.perf_counter()
-            res = fn(img)
-            latencies.append(time.perf_counter() - s)
-            per_frame_ids[name].append(res)
-        total = time.perf_counter() - t0
-        lat = np.array(latencies) * 1e3
-        results[name] = dict(
-            fps=len(imgs) / total,
-            mean_ms=lat.mean(),
-            p50_ms=np.percentile(lat, 50),
-            p99_ms=np.percentile(lat, 99),
-            detections=sum(len(r) for r in per_frame_ids[name]),
-        )
+    cvd = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(CV_DICT))
 
-    # parity
-    n_frames = len(imgs)
-    both = agree_ids = ft_extra = cv_extra = 0
+    s = lat_ms(lambda im: fasttag.detect_markers(im, DICT), c0)
+    print(f"fasttag single-frame:    {1000/s.mean():6.1f} FPS   mean={s.mean():.2f}ms  p99={np.percentile(s,99):.2f}ms")
+
+    pairs = list(zip(c0, c1))
+    d = lat_ms(lambda pr: fasttag.detect_markers_batch(list(pr), DICT), pairs)
+    print(f"fasttag dual-cam pair:   {1000/d.mean():6.1f} pairs/s ({2000/d.mean():.0f} fps total)  mean={d.mean():.2f}ms/pair")
+
+    allf = c0 + c1
+    t = time.perf_counter()
+    fasttag.detect_markers_batch(allf, DICT)
+    bt = time.perf_counter() - t
+    print(f"fasttag offline batch:   {len(allf)/bt:6.1f} FPS   ({len(allf)} frames, all cores)")
+
+    o = lat_ms(lambda im: cvd.detectMarkers(im), c0)
+    print(f"opencv  single-frame:    {1000/o.mean():6.1f} FPS   mean={o.mean():.2f}ms")
+
+    # parity vs OpenCV
+    res = fasttag.detect_markers_batch(c0, DICT)
+    agree = ftonly = cvonly = 0
     errs = []
-    for k in range(n_frames):
-        fk = per_frame_ids["fasttag"][k]
-        ck = per_frame_ids["opencv"][k]
-        fk_ids, ck_ids = set(fk), set(ck)
-        agree_ids += len(fk_ids & ck_ids)
-        ft_extra += len(fk_ids - ck_ids)
-        cv_extra += len(ck_ids - fk_ids)
-        for mid in fk_ids & ck_ids:
-            both += 1
-            errs.append(corner_err(fk[mid], ck[mid]))
-
-    print(f"{'engine':10s} {'FPS':>8s} {'mean ms':>9s} {'p50 ms':>8s} {'p99 ms':>8s} {'dets':>7s}")
-    for name, r in results.items():
-        print(f"{name:10s} {r['fps']:8.1f} {r['mean_ms']:9.2f} {r['p50_ms']:8.2f} {r['p99_ms']:8.2f} {r['detections']:7d}")
-
-    speedup = results["fasttag"]["fps"] / results["opencv"]["fps"]
-    print(f"\nfasttag / opencv throughput: {speedup:.2f}x")
-    print(f"\nParity over {n_frames} frames:")
-    print(f"  markers agreed (same id both):   {agree_ids}")
-    print(f"  fasttag-only detections:         {ft_extra}")
-    print(f"  opencv-only detections:          {cv_extra}")
-    if errs:
-        e = np.array(errs)
-        print(f"  corner error vs opencv (px): mean={e.mean():.3f} p99={np.percentile(e,99):.3f} max={e.max():.3f}")
+    for im, (cb, ib) in zip(c0, res):
+        cc, ci, _ = cvd.detectMarkers(im)
+        di = {} if ci is None else {int(k): v.reshape(4, 2) for k, v in zip(ci.flatten(), cc)}
+        fi = {int(k): np.array(v) for k, v in zip(ib, cb)}
+        for k in set(fi) & set(di):
+            agree += 1
+            errs.append(min(np.abs(np.roll(fi[k], r, axis=0) - di[k]).max() for r in range(4)))
+        ftonly += len(set(fi) - set(di))
+        cvonly += len(set(di) - set(fi))
+    e = np.array(errs)
+    print(f"\nParity vs OpenCV ({len(c0)} frames): agreed={agree} fasttag-only={ftonly} opencv-only={cvonly}")
+    print(f"corner error vs OpenCV (px): mean={e.mean():.4f} p99={np.percentile(e,99):.3f} max={e.max():.3f}")
 
 
 if __name__ == "__main__":

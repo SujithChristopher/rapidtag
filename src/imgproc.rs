@@ -4,6 +4,7 @@
 
 use image::GrayImage;
 use nalgebra::{SMatrix, SVector};
+use rayon::prelude::*;
 
 type Matrix8 = SMatrix<f64, 8, 8>;
 type Vector8 = SVector<f64, 8>;
@@ -32,7 +33,9 @@ pub fn to_gray(data: Vec<u8>, h: usize, w: usize, channels: usize) -> GrayImage 
 /// Adaptive threshold, ADAPTIVE_THRESH_MEAN_C + THRESH_BINARY_INV.
 /// For each pixel: T = mean(win x win neighbourhood) - c; out = src > T ? 0 : 255.
 /// Uses a clamped-window mean (border pixels divide by the true covered area).
-pub fn adaptive_threshold_mean_inv(src: &GrayImage, mut win: u32, c: f64) -> GrayImage {
+/// `parallel` row-parallelizes the compare loop (use for single-frame; leave off
+/// when the caller already parallelizes across frames).
+pub fn adaptive_threshold_mean_inv(src: &GrayImage, mut win: u32, c: f64, parallel: bool) -> GrayImage {
     if win < 3 {
         win = 3;
     }
@@ -59,30 +62,41 @@ pub fn adaptive_threshold_mean_inv(src: &GrayImage, mut win: u32, c: f64) -> Gra
             dst[x + 1] = prev[x + 1] + row_sum;
         }
     }
-    let rect_sum = |x0: i64, y0: i64, x1: i64, y1: i64| -> i32 {
-        // inclusive rect [x0,x1]x[y0,y1] in image coords
-        let a = integral[(y1 + 1) as usize * iw + (x1 + 1) as usize];
-        let b = integral[y0 as usize * iw + (x1 + 1) as usize];
-        let cc = integral[(y1 + 1) as usize * iw + x0 as usize];
-        let d = integral[y0 as usize * iw + x0 as usize];
-        a - b - cc + d
-    };
+    // Integer form of `src > round(mean) - C`, with mean = sum/area:
+    //   dst=0  ⟺  src > floor(sum/area + 0.5) - C  ⟺  2*sum + area < 2*area*(src + C)
+    // No per-pixel division → autovectorizes under target-cpu=native.
+    let c_int = c as i32;
+    let wu = w as usize;
+    let mut out = vec![0u8; wu * h as usize];
 
-    let mut out = vec![0u8; (w * h) as usize];
-    for y in 0..h {
+    // Per-output-row compare against the integral image (read-only, shared).
+    let compute_row = |y: i64, out_row: &mut [u8]| {
         let y0 = (y - radius).max(0);
         let y1 = (y + radius).min(h - 1);
-        for x in 0..w {
-            let x0 = (x - radius).max(0);
-            let x1 = (x + radius).min(w - 1);
-            let area = (x1 - x0 + 1) * (y1 - y0 + 1);
-            let sum = rect_sum(x0, y0, x1, y1) as i64;
-            // OpenCV boxFilter rounds the mean.
-            let mean = ((sum as f64) / (area as f64) + 0.5).floor() as i64;
-            let t = mean - c as i64;
-            let v = sp[(y * w + x) as usize] as i64;
-            out[(y * w + x) as usize] = if v > t { 0u8 } else { 255u8 };
+        let yspan = (y1 - y0 + 1) as i32;
+        let iy0 = y0 as usize * iw;
+        let iy1 = (y1 + 1) as usize * iw;
+        let sp_row = &sp[(y * w) as usize..(y * w) as usize + wu];
+        for x in 0..wu {
+            let xi = x as i64;
+            let x0 = (xi - radius).max(0) as usize;
+            let x1 = (xi + radius).min(w - 1) as usize;
+            let area = (x1 - x0 + 1) as i32 * yspan;
+            let sum = integral[iy1 + x1 + 1] - integral[iy0 + x1 + 1] - integral[iy1 + x0]
+                + integral[iy0 + x0];
+            let v = sp_row[x] as i32;
+            out_row[x] = if 2 * sum + area < 2 * area * (v + c_int) { 0u8 } else { 255u8 };
         }
+    };
+
+    if parallel {
+        out.par_chunks_mut(wu)
+            .enumerate()
+            .for_each(|(y, row)| compute_row(y as i64, row));
+    } else {
+        out.chunks_mut(wu)
+            .enumerate()
+            .for_each(|(y, row)| compute_row(y as i64, row));
     }
     GrayImage::from_raw(w as u32, h as u32, out).expect("threshold buffer size")
 }

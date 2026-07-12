@@ -146,16 +146,8 @@ fn extract_frame(arr: &PyReadonlyArrayDyn<u8>) -> PyResult<FrameData> {
     Ok(FrameData { data, h, w, ch })
 }
 
-/// Run detection on an owned frame (no Python interaction — safe off the GIL).
-/// `parallel_scales` should be false when the caller parallelizes across frames.
-fn detect_frame(
-    fd: FrameData,
-    dict: &dictionary::Dictionary,
-    params: &DetectorParameters,
-    parallel_scales: bool,
-) -> MarkerResult {
-    let gray = imgproc::to_gray(fd.data, fd.h, fd.w, fd.ch);
-    let (detections, _rejected) = detector::detect_markers(&gray, dict, params, parallel_scales);
+/// Convert internal detections into the Python-facing (corners, ids) shape.
+fn to_result(detections: Vec<detector::Detection>) -> MarkerResult {
     let mut corners = Vec::with_capacity(detections.len());
     let mut ids = Vec::with_capacity(detections.len());
     for d in detections {
@@ -178,6 +170,7 @@ fn detect_frame(
 #[pyfunction]
 #[pyo3(signature = (image, dictionary, parameters=None))]
 fn detect_markers(
+    py: Python<'_>,
     image: PyReadonlyArrayDyn<u8>,
     dictionary: &str,
     parameters: Option<PyDetectorParameters>,
@@ -186,12 +179,14 @@ fn detect_markers(
         .ok_or_else(|| PyValueError::new_err(format!("unknown dictionary: {dictionary}")))?;
     let params = parameters.map(|p| p.inner).unwrap_or_default();
     let fd = extract_frame(&image)?;
-    // single frame: parallelize the threshold scales
-    Ok(detect_frame(fd, &dict, &params, true))
+    let gray = imgproc::to_gray(fd.data, fd.h, fd.w, fd.ch);
+    let (detections, _) = py.allow_threads(|| detector::detect_markers(&gray, &dict, &params));
+    Ok(to_result(detections))
 }
 
-/// Detect markers in a batch of frames, processed in parallel across all cores
-/// with the GIL released. Ideal for offline processing of many frames.
+/// Detect markers across a batch of frames using flat (frame × scale) parallelism
+/// with the GIL released. Optimal at any batch size — a single frame, a dual-camera
+/// pair, or a large offline batch all keep the cores busy without nested threading.
 ///
 /// Returns a list of `(corners, ids)`, one per input frame, in the same order.
 #[pyfunction]
@@ -202,26 +197,19 @@ fn detect_markers_batch(
     dictionary: &str,
     parameters: Option<PyDetectorParameters>,
 ) -> PyResult<Vec<MarkerResult>> {
-    use rayon::prelude::*;
-
     let dict = dictionary::get_predefined_dictionary(dictionary)
         .ok_or_else(|| PyValueError::new_err(format!("unknown dictionary: {dictionary}")))?;
     let params = parameters.map(|p| p.inner).unwrap_or_default();
 
     // Copy pixels out of Python objects while we hold the GIL...
-    let frames: Vec<FrameData> = images
+    let grays: Vec<image::GrayImage> = images
         .iter()
-        .map(extract_frame)
+        .map(|arr| extract_frame(arr).map(|fd| imgproc::to_gray(fd.data, fd.h, fd.w, fd.ch)))
         .collect::<PyResult<Vec<_>>>()?;
 
     // ...then detect in parallel with the GIL released.
-    let results = py.allow_threads(|| {
-        frames
-            .into_par_iter()
-            .map(|fd| detect_frame(fd, &dict, &params, false))
-            .collect()
-    });
-    Ok(results)
+    let results = py.allow_threads(|| detector::detect_markers_multi(grays, &dict, &params));
+    Ok(results.into_iter().map(|(dets, _)| to_result(dets)).collect())
 }
 
 #[pymodule]

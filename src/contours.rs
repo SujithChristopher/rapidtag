@@ -9,7 +9,18 @@
 //! border-start conditions match imageproc exactly, so downstream output is
 //! identical.
 
-use image::GrayImage;
+// Label alphabet (i8, not i32): the Suzuki-Abe NBD *magnitude* is only used for
+// hierarchy, which the aruco pipeline discards — so we never need distinct
+// per-contour ids, only to mark visited pixels and keep the +/- sign that the
+// border-start test relies on. Collapsing to {0,FG,POS,NEG} shrinks this buffer
+// 4x (the dominant cost is streaming it, not the tracing).
+//
+// FG is `pub` because the adaptive threshold writes the foreground mask straight
+// into this same padded buffer (fused, no separate 0/255 image), so it must agree
+// on the foreground marker value.
+pub const FG: i8 = 1; // unlabeled foreground
+const POS: i8 = 2; // traced, positive (interior-capable)
+const NEG: i8 = -2; // traced, negative (right edge)
 
 // 8-neighborhood offsets, in imageproc's order (index == search position).
 const DIRS: [(i32, i32); 8] = [
@@ -38,45 +49,28 @@ fn dir_index(d: (i32, i32)) -> usize {
     }
 }
 
-/// Trace all borders of foreground (non-zero) regions in a binary image, invoking
-/// `f` once per contour with the ordered pixel coordinates in a *reused* buffer.
+/// Trace all borders of foreground regions, invoking `f` once per contour with the
+/// ordered pixel coordinates in a *reused* buffer.
 ///
-/// The buffer is borrowed only for the duration of each call — the caller copies
-/// out what it needs. This avoids allocating a `Vec` per contour, which matters
+/// `lbl` is a 1-pixel zero-padded label buffer (stride `w+2`, height `h+2`) that the
+/// adaptive threshold has already filled: `FG` at foreground pixels, `0` everywhere
+/// else including the border ring. Fusing the binarize into the threshold this way
+/// saves a whole full-image pass and the separate 0/255 image. The buffer is
+/// consumed (mutated in place with trace labels); the caller hands over ownership.
+///
+/// The per-contour buffer is borrowed only for the duration of each call — the caller
+/// copies out what it needs. This avoids allocating a `Vec` per contour, which matters
 /// because a thresholded frame contains hundreds of tiny noise contours that the
 /// aruco size filter immediately discards.
-pub fn for_each_contour<F: FnMut(&[(i32, i32)])>(thresh: &GrayImage, mut f: F) {
-    let w = thresh.width() as i32;
-    let h = thresh.height() as i32;
+pub fn for_each_contour<F: FnMut(&[(i32, i32)])>(lbl: &mut [i8], w: i32, h: i32, mut f: F) {
     if w == 0 || h == 0 {
         return;
     }
     let stride = (w + 2) as usize;
-    // Label alphabet (i8, not i32): the Suzuki-Abe NBD *magnitude* is only used for
-    // hierarchy, which the aruco pipeline discards — so we never need distinct
-    // per-contour ids, only to mark visited pixels and keep the +/- sign that the
-    // border-start test relies on. Collapsing to {0,1,POS,NEG} shrinks this buffer
-    // 4x (the dominant cost is streaming it, not the tracing), and it's the same
-    // buffer we scan and binarize into every frame.
-    const FG: i8 = 1; // unlabeled foreground
-    const POS: i8 = 2; // traced, positive (interior-capable)
-    const NEG: i8 = -2; // traced, negative (right edge)
-    let mut lbl = vec![0i8; stride * (h + 2) as usize];
-    let src = thresh.as_raw();
+    debug_assert_eq!(lbl.len(), stride * (h + 2) as usize);
 
     // padded index for a real coordinate; valid for x in [-1, w], y in [-1, h]
     let idx = |x: i32, y: i32| -> usize { (y + 1) as usize * stride + (x + 1) as usize };
-
-    // binarize into the padded buffer (1 = unlabeled foreground)
-    for y in 0..h {
-        let row = &src[(y * w) as usize..(y * w + w) as usize];
-        let base = (y + 1) as usize * stride + 1;
-        for x in 0..w as usize {
-            if row[x] > 0 {
-                lbl[base + x] = FG;
-            }
-        }
-    }
 
     let max_points = (w as usize) * (h as usize) + 1; // hang guard
     let mut points: Vec<(i32, i32)> = Vec::new(); // reused across contours

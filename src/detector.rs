@@ -57,9 +57,10 @@ impl Default for DetectorParameters {
 
 type Quad = [Pt; 4];
 
-/// Extract square marker candidates from an already-thresholded image.
-fn find_marker_contours(thresh: &GrayImage, p: &DetectorParameters) -> Vec<Quad> {
-    let (w, h) = (thresh.width() as f64, thresh.height() as f64);
+/// Extract square marker candidates from a pre-filled contour label buffer (the
+/// fused threshold has already written the foreground mask into `lbl`).
+fn find_marker_contours(lbl: &mut [i8], iw: i32, ih: i32, p: &DetectorParameters) -> Vec<Quad> {
+    let (w, h) = (iw as f64, ih as f64);
     let max_wh = w.max(h);
 
     let mut min_perimeter = (p.min_marker_perimeter_rate * max_wh) as usize;
@@ -73,7 +74,7 @@ fn find_marker_contours(thresh: &GrayImage, p: &DetectorParameters) -> Vec<Quad>
     let mut pts: Vec<Pt> = Vec::new(); // reused f32 buffer
     // Trace + filter fused: most contours are tiny noise and are rejected by the
     // size test before we ever allocate for them.
-    for_each_contour(thresh, |contour| {
+    for_each_contour(lbl, iw, ih, |contour| {
         let n = contour.len();
         if n < min_perimeter || n > max_perimeter {
             return;
@@ -332,24 +333,13 @@ fn n_scales(p: &DetectorParameters) -> i32 {
         + 1
 }
 
-/// Candidate quads found at one threshold scale (STEP 1 for a single scale).
-/// `parallel_threshold` parallelizes the integral+compare internally; use it when
-/// scales are computed sequentially (single frame), off when the caller already
-/// parallelizes across frames/scales (batch).
-fn candidates_for_scale(
-    gray: &GrayImage,
-    p: &DetectorParameters,
-    scale_i: i32,
-    parallel_threshold: bool,
-) -> Vec<Quad> {
+/// Candidate quads found at one threshold scale (STEP 1 for a single scale). The
+/// threshold writes its foreground mask straight into the contour label buffer, so
+/// there is no intermediate 0/255 image.
+fn candidates_for_scale(gray: &GrayImage, p: &DetectorParameters, scale_i: i32) -> Vec<Quad> {
     let win = p.adaptive_thresh_win_size_min + scale_i * p.adaptive_thresh_win_size_step;
-    let thresh = imgproc::adaptive_threshold_mean_inv(
-        gray,
-        win as u32,
-        p.adaptive_thresh_constant,
-        parallel_threshold,
-    );
-    find_marker_contours(&thresh, p)
+    let mut lbl = imgproc::adaptive_threshold_labels(gray, win as u32, p.adaptive_thresh_constant);
+    find_marker_contours(&mut lbl, gray.width() as i32, gray.height() as i32, p)
 }
 
 /// STEP 2 + 3: reorder, drop near-duplicates, identify. `candidates` must already
@@ -389,7 +379,7 @@ pub fn detect_markers(
 ) -> (Vec<Detection>, Vec<Quad>) {
     let per_scale: Vec<Vec<Quad>> = (0..n_scales(p))
         .into_par_iter()
-        .map(|i| candidates_for_scale(gray, p, i, false))
+        .map(|i| candidates_for_scale(gray, p, i))
         .collect();
     let candidates: Vec<Quad> = per_scale.into_iter().flatten().collect();
     finalize(gray, candidates, dict, p)
@@ -413,7 +403,7 @@ pub fn detect_markers_multi(
         .collect();
     let partial: Vec<Vec<Quad>> = work
         .par_iter()
-        .map(|&(f, s)| candidates_for_scale(&grays[f], p, s, false))
+        .map(|&(f, s)| candidates_for_scale(&grays[f], p, s))
         .collect();
 
     // Regroup candidates per frame (partial is in the same (frame, scale) order).

@@ -1,10 +1,10 @@
 [package]
-name = "fasttag"
+name = "rapidtag"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "fasttag"
+name = "rapidtag"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]

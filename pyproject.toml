@@ -3,9 +3,9 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "fasttag"
+name = "rapidtag"
 version = "0.1.0"
-description = "Pure-Rust port of OpenCV's aruco marker detection (maturin/PyO3)"
+description = "RapidTag — fast realtime fiducial marker (ArUco/AprilTag) detection in Rust"
 readme = "README.md"
 requires-python = ">=3.9"
 classifiers = [

@@ -1,4 +1,4 @@
-"""Benchmark fasttag vs OpenCV aruco on real OV9281 dual-cam frames.
+"""Benchmark rapidtag vs OpenCV aruco on real OV9281 dual-cam frames.
 
 Reads frames through the msgpack + msgpack_numpy pipeline and reports:
   - single-frame latency (realtime, one camera)
@@ -12,7 +12,7 @@ import numpy as np
 import msgpack
 import msgpack_numpy as mpn
 import cv2
-import fasttag
+import rapidtag
 
 DICT = "DICT_APRILTAG_36h11"
 CV_DICT = cv2.aruco.DICT_APRILTAG_36h11
@@ -45,29 +45,29 @@ def main():
 
     # warmup
     for im in c0[:20]:
-        fasttag.detect_markers(im, DICT)
-    fasttag.detect_markers_batch(c0[:8], DICT)
+        rapidtag.detect_markers(im, DICT)
+    rapidtag.detect_markers_batch(c0[:8], DICT)
 
     cvd = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(CV_DICT))
 
-    s = lat_ms(lambda im: fasttag.detect_markers(im, DICT), c0)
-    print(f"fasttag single-frame:    {1000/s.mean():6.1f} FPS   mean={s.mean():.2f}ms  p99={np.percentile(s,99):.2f}ms")
+    s = lat_ms(lambda im: rapidtag.detect_markers(im, DICT), c0)
+    print(f"rapidtag single-frame:    {1000/s.mean():6.1f} FPS   mean={s.mean():.2f}ms  p99={np.percentile(s,99):.2f}ms")
 
     pairs = list(zip(c0, c1))
-    d = lat_ms(lambda pr: fasttag.detect_markers_batch(list(pr), DICT), pairs)
-    print(f"fasttag dual-cam pair:   {1000/d.mean():6.1f} pairs/s ({2000/d.mean():.0f} fps total)  mean={d.mean():.2f}ms/pair")
+    d = lat_ms(lambda pr: rapidtag.detect_markers_batch(list(pr), DICT), pairs)
+    print(f"rapidtag dual-cam pair:   {1000/d.mean():6.1f} pairs/s ({2000/d.mean():.0f} fps total)  mean={d.mean():.2f}ms/pair")
 
     allf = c0 + c1
     t = time.perf_counter()
-    fasttag.detect_markers_batch(allf, DICT)
+    rapidtag.detect_markers_batch(allf, DICT)
     bt = time.perf_counter() - t
-    print(f"fasttag offline batch:   {len(allf)/bt:6.1f} FPS   ({len(allf)} frames, all cores)")
+    print(f"rapidtag offline batch:   {len(allf)/bt:6.1f} FPS   ({len(allf)} frames, all cores)")
 
     o = lat_ms(lambda im: cvd.detectMarkers(im), c0)
     print(f"opencv  single-frame:    {1000/o.mean():6.1f} FPS   mean={o.mean():.2f}ms")
 
     # parity vs OpenCV
-    res = fasttag.detect_markers_batch(c0, DICT)
+    res = rapidtag.detect_markers_batch(c0, DICT)
     agree = ftonly = cvonly = 0
     errs = []
     for im, (cb, ib) in zip(c0, res):
@@ -80,7 +80,7 @@ def main():
         ftonly += len(set(fi) - set(di))
         cvonly += len(set(di) - set(fi))
     e = np.array(errs)
-    print(f"\nParity vs OpenCV ({len(c0)} frames): agreed={agree} fasttag-only={ftonly} opencv-only={cvonly}")
+    print(f"\nParity vs OpenCV ({len(c0)} frames): agreed={agree} rapidtag-only={ftonly} opencv-only={cvonly}")
     print(f"corner error vs OpenCV (px): mean={e.mean():.4f} p99={np.percentile(e,99):.3f} max={e.max():.3f}")
 
 

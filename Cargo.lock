@@ -99,20 +99,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
-name = "fasttag"
-version = "0.1.0"
-dependencies = [
- "image",
- "imageproc",
- "mimalloc",
- "nalgebra 0.33.3",
- "ndarray",
- "numpy",
- "pyo3",
- "rayon",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -599,6 +585,20 @@ checksum = "32cb0b9bc82b0a0876c2dd994a7e7a2683d3e7390ca40e6886785ef0c7e3ee31"
 dependencies = [
  "num-traits",
  "rand",
+]
+
+[[package]]
+name = "rapidtag"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "imageproc",
+ "mimalloc",
+ "nalgebra 0.33.3",
+ "ndarray",
+ "numpy",
+ "pyo3",
+ "rayon",
 ]
 
 [[package]]

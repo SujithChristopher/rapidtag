@@ -1,7 +1,7 @@
-"""Cross-check fasttag against OpenCV's aruco on synthetic scenes."""
+"""Cross-check rapidtag against OpenCV's aruco on synthetic scenes."""
 import numpy as np
 import cv2
-import fasttag
+import rapidtag
 
 DICTS = {
     "DICT_4X4_50": cv2.aruco.DICT_4X4_50,
@@ -48,7 +48,7 @@ def main():
         canvas, _ = make_scene(cv_dict, ids)
 
         cv_res = cv_detect(canvas, cv_dict)
-        ft_corners, ft_ids = fasttag.detect_markers(canvas, name)
+        ft_corners, ft_ids = rapidtag.detect_markers(canvas, name)
         ft_res = {int(i): np.array(c) for i, c in zip(ft_ids, ft_corners)}
 
         expected = set(ids)
@@ -69,7 +69,7 @@ def main():
                     max_corner_err = max(max_corner_err, best)
         print(
             f"{name:22s} expected={len(expected):2d} "
-            f"fasttag={len(ft_found & expected):2d} opencv={len(cv_found & expected):2d} "
+            f"rapidtag={len(ft_found & expected):2d} opencv={len(cv_found & expected):2d} "
             f"false+={len(ft_found - expected)}"
         )
 

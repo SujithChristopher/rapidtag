@@ -1,5 +1,5 @@
-//! fasttag — a pure-Rust port of OpenCV's aruco marker detection, exposed to
-//! Python via PyO3/maturin. v1: detectMarkers (CORNER_REFINE_NONE).
+//! RapidTag — fast, pure-Rust fiducial marker detection for realtime use,
+//! exposed to Python via PyO3/maturin. v1: detectMarkers (CORNER_REFINE_NONE).
 
 mod contours;
 mod detector;
@@ -214,7 +214,7 @@ fn detect_markers_batch(
 }
 
 #[pymodule]
-fn fasttag(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn rapidtag(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDetectorParameters>()?;
     m.add_function(wrap_pyfunction!(detect_markers, m)?)?;
     m.add_function(wrap_pyfunction!(detect_markers_batch, m)?)?;

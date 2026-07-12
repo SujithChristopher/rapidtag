@@ -4,7 +4,6 @@
 
 use image::GrayImage;
 use nalgebra::{SMatrix, SVector};
-use rayon::prelude::*;
 
 type Matrix8 = SMatrix<f64, 8, 8>;
 type Vector8 = SVector<f64, 8>;
@@ -30,19 +29,24 @@ pub fn to_gray(data: Vec<u8>, h: usize, w: usize, channels: usize) -> GrayImage 
     GrayImage::from_raw(w as u32, h as u32, out).expect("gray buffer size")
 }
 
-/// Adaptive threshold, ADAPTIVE_THRESH_MEAN_C + THRESH_BINARY_INV.
-/// For each pixel: T = mean(win x win neighbourhood) - c; out = src > T ? 0 : 255.
-/// Uses a clamped-window mean (border pixels divide by the true covered area).
+/// Adaptive threshold (ADAPTIVE_THRESH_MEAN_C + THRESH_BINARY_INV) fused with the
+/// contour tracer's label layout. For each pixel T = mean(win x win) - c; the
+/// foreground is `src <= T` (the INV sense). Uses a clamped-window mean (border
+/// pixels divide by the true covered area).
 ///
-/// Computed with an O(1)-per-pixel sliding box sum instead of a full integral
-/// image: a running per-column vertical sum (`colsum`, one row wide) advanced down
-/// the image, then a running horizontal sum across it. This keeps the working set
-/// to ~one row (a few KB, cache-resident) instead of a multi-MB integral table.
+/// Rather than emit a 0/255 image that the contour step must then re-scan and
+/// binarize, this writes the foreground mask *directly* into a 1-pixel zero-padded
+/// `i8` label buffer (stride `w+2`, height `h+2`): [`FG`] at foreground pixels, `0`
+/// everywhere else including the border ring. `for_each_contour` traces that buffer
+/// in place, so we save a whole full-image pass and the separate u8 allocation.
 ///
-/// `parallel` splits the rows into independent bands (each seeds its own `colsum`
-/// from scratch). Because the sliding sum is low-bandwidth, this scales well —
-/// unlike the old integral-image threshold, which was bandwidth bound.
-pub fn adaptive_threshold_mean_inv(src: &GrayImage, mut win: u32, c: f64, parallel: bool) -> GrayImage {
+/// The mean is an O(1)-per-pixel sliding box sum, not a full integral image: a
+/// running per-column vertical sum (`colsum`, one row wide) advanced down the image,
+/// then a 1D prefix across it so any window sum is a difference of two entries. The
+/// working set stays ~one row (a few KB, cache-resident) instead of a multi-MB
+/// integral table, which is why this stays single-threaded — it's compute-light and
+/// bandwidth-cheap, and the scales above it already run one-per-core.
+pub fn adaptive_threshold_labels(src: &GrayImage, mut win: u32, c: f64) -> Vec<i8> {
     if win < 3 {
         win = 3;
     }
@@ -55,100 +59,87 @@ pub fn adaptive_threshold_mean_inv(src: &GrayImage, mut win: u32, c: f64, parall
     let sp = src.as_raw();
     let c_int = c as i32;
 
-    let mut out = vec![0u8; w * h];
+    let stride = w + 2;
+    let mut lbl = vec![0i8; stride * (h + 2)];
+    let row_at = |y: usize| &sp[y * w..y * w + w];
 
-    // Fill output rows [r0, r0+nrows) using a from-scratch seeded sliding window.
-    let process_band = |out_band: &mut [u8], r0: usize| {
-        let row_at = |y: usize| &sp[y * w..y * w + w];
-        let nrows = out_band.len() / w;
+    // seed colsum for row 0
+    let mut cur_top = 0usize;
+    let mut cur_bot = radius.min(h - 1);
+    let mut colsum = vec![0i32; w];
+    for yy in cur_top..=cur_bot {
+        let r = row_at(yy);
+        for x in 0..w {
+            colsum[x] += r[x] as i32;
+        }
+    }
 
-        // seed colsum for the first output row of the band
-        let mut cur_top = r0.saturating_sub(radius);
-        let mut cur_bot = (r0 + radius).min(h - 1);
-        let mut colsum = vec![0i32; w];
-        for yy in cur_top..=cur_bot {
-            let r = row_at(yy);
+    // hpre[x] = prefix sum of colsum (hpre[0]=0, len w+1), reused per row.
+    let mut hpre = vec![0i32; w + 1];
+    // interior column span [lo, hi) where the full window fits: x-radius>=0 and x+radius<=w-1
+    let lo = radius.min(w);
+    let hi = w.saturating_sub(radius).max(lo);
+
+    for y in 0..h {
+        let target_bot = (y + radius).min(h - 1);
+        while cur_bot < target_bot {
+            cur_bot += 1;
+            let r = row_at(cur_bot);
             for x in 0..w {
                 colsum[x] += r[x] as i32;
             }
         }
-
-        // hpre[x] = prefix sum of colsum (hpre[0]=0, len w+1), reused per row.
-        let mut hpre = vec![0i32; w + 1];
-        // interior column span [lo, hi) where the full window fits: x-radius>=0 and x+radius<=w-1
-        let lo = radius.min(w);
-        let hi = w.saturating_sub(radius).max(lo);
-
-        for i in 0..nrows {
-            let y = r0 + i;
-            let target_bot = (y + radius).min(h - 1);
-            while cur_bot < target_bot {
-                cur_bot += 1;
-                let r = row_at(cur_bot);
-                for x in 0..w {
-                    colsum[x] += r[x] as i32;
-                }
-            }
-            let target_top = y.saturating_sub(radius);
-            while cur_top < target_top {
-                let r = row_at(cur_top);
-                for x in 0..w {
-                    colsum[x] -= r[x] as i32;
-                }
-                cur_top += 1;
-            }
-            let yspan = (cur_bot - cur_top + 1) as i32;
-
-            // 1D prefix of colsum so any window sum is a difference of two entries.
-            let mut acc = 0i32;
+        let target_top = y.saturating_sub(radius);
+        while cur_top < target_top {
+            let r = row_at(cur_top);
             for x in 0..w {
-                acc += colsum[x];
-                hpre[x + 1] = acc;
+                colsum[x] -= r[x] as i32;
             }
-
-            let out_row = &mut out_band[i * w..i * w + w];
-            let src_row = row_at(y);
-            // integer compare: dst=0 ⟺ 2*sum + area < 2*area*(src + C)
-
-            // border-left columns (partial window) — scalar
-            for x in 0..lo {
-                let x1 = (x + radius).min(w - 1);
-                let sum = hpre[x1 + 1]; // hpre[0] == 0
-                let area = (x1 + 1) as i32 * yspan;
-                let v = src_row[x] as i32;
-                out_row[x] = if 2 * sum + area < 2 * area * (v + c_int) { 0 } else { 255 };
-            }
-
-            // interior columns (full window: constant area) — branchless, vectorizable
-            let area = (2 * radius + 1) as i32 * yspan;
-            let two_area = 2 * area;
-            for x in lo..hi {
-                let sum = hpre[x + radius + 1] - hpre[x - radius];
-                let v = src_row[x] as i32;
-                out_row[x] = if 2 * sum + area < two_area * (v + c_int) { 0 } else { 255 };
-            }
-
-            // border-right columns (partial window) — scalar
-            for x in hi..w {
-                let x0 = x - radius;
-                let sum = hpre[w] - hpre[x0];
-                let area = (w - x0) as i32 * yspan;
-                let v = src_row[x] as i32;
-                out_row[x] = if 2 * sum + area < 2 * area * (v + c_int) { 0 } else { 255 };
-            }
+            cur_top += 1;
         }
-    };
+        let yspan = (cur_bot - cur_top + 1) as i32;
 
-    if parallel {
-        let nbands = rayon::current_num_threads().max(1).min(h.max(1));
-        let band_rows = h.div_ceil(nbands);
-        out.par_chunks_mut(band_rows * w)
-            .enumerate()
-            .for_each(|(b, chunk)| process_band(chunk, b * band_rows));
-    } else {
-        process_band(&mut out, 0);
+        // 1D prefix of colsum so any window sum is a difference of two entries.
+        let mut acc = 0i32;
+        for x in 0..w {
+            acc += colsum[x];
+            hpre[x + 1] = acc;
+        }
+
+        // padded row start for real x=0 (skip the 1px border row and column)
+        let out_base = (y + 1) * stride + 1;
+        let src_row = row_at(y);
+        // integer compare: background ⟺ 2*sum + area < 2*area*(src + C); the
+        // complement (the old `else { 255 }`) is foreground = FG.
+
+        // border-left columns (partial window) — scalar
+        for x in 0..lo {
+            let x1 = (x + radius).min(w - 1);
+            let sum = hpre[x1 + 1]; // hpre[0] == 0
+            let area = (x1 + 1) as i32 * yspan;
+            let v = src_row[x] as i32;
+            lbl[out_base + x] = if 2 * sum + area < 2 * area * (v + c_int) { 0 } else { crate::contours::FG };
+        }
+
+        // interior columns (full window: constant area) — branchless, vectorizable
+        let area = (2 * radius + 1) as i32 * yspan;
+        let two_area = 2 * area;
+        for x in lo..hi {
+            let sum = hpre[x + radius + 1] - hpre[x - radius];
+            let v = src_row[x] as i32;
+            lbl[out_base + x] = if 2 * sum + area < two_area * (v + c_int) { 0 } else { crate::contours::FG };
+        }
+
+        // border-right columns (partial window) — scalar
+        for x in hi..w {
+            let x0 = x - radius;
+            let sum = hpre[w] - hpre[x0];
+            let area = (w - x0) as i32 * yspan;
+            let v = src_row[x] as i32;
+            lbl[out_base + x] = if 2 * sum + area < 2 * area * (v + c_int) { 0 } else { crate::contours::FG };
+        }
     }
-    GrayImage::from_raw(w as u32, h as u32, out).expect("threshold buffer size")
+    lbl
 }
 
 /// Otsu threshold level over a grayscale buffer (0..=255 histogram).

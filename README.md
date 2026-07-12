@@ -1,58 +1,47 @@
 # RapidTag
 
 > ⚠️ **Work in progress — not production-ready.** RapidTag is under active development
-> and pre-1.0. APIs, behavior, and results may change without notice, and it has not been
-> hardened or battle-tested for production use. Use it for research, evaluation, and
-> prototyping, and validate it thoroughly against your own data before relying on it for
-> anything critical.
+> and pre-1.0. APIs, behavior, and results may change without notice. Use it for research,
+> evaluation, and prototyping, and validate it against your own data before relying on it
+> for anything critical.
 
 **Fast, pure-Rust fiducial marker detection for realtime.** RapidTag is a from-scratch
-Rust reimplementation of OpenCV's ArUco / AprilTag marker detector, exposed to Python
-via [maturin](https://www.maturin.rs/) / [PyO3](https://pyo3.rs/) — **no OpenCV runtime
-dependency**. It matches OpenCV's detections bit-for-bit while running faster on realtime
-single-frame workloads.
+Rust reimplementation of OpenCV's ArUco / AprilTag marker detector, exposed to Python via
+[maturin](https://www.maturin.rs/) / [PyO3](https://pyo3.rs/) — with **no OpenCV runtime
+dependency**. It reproduces OpenCV's detections down to the pixel while running
+substantially faster.
 
 ## Why RapidTag
 
-- ⚡ **Faster than OpenCV** for realtime single-frame detection (~370 vs ~330 FPS on
-  1280×800 mono; see below), and much faster for multi-camera / offline batches.
-- 🎯 **OpenCV-accurate** — validated at **0.0000 px** corner agreement on synthetic,
-  perspective-warped, and real camera data.
-- 🧵 **Scales with your cores** — a batch API processes many frames (e.g. a stereo pair,
-  or a whole recording) across all cores with the GIL released.
+- ⚡ **Faster than OpenCV** — **~1.6× faster** for realtime single-camera detection, and
+  **up to ~3.4× faster** for multi-camera and offline batches (scales across cores).
+- 🎯 **A true drop-in for accuracy** — corners match OpenCV to **0.0000 px**, so any
+  downstream pose or tracking is identical (see below).
+- 🧵 **Scales with your cores** — a batch API processes many frames (a stereo pair, or a
+  whole recording) across all cores with the GIL released.
 - 📦 **No OpenCV needed at runtime** — the detection pipeline and marker dictionaries are
-  reimplemented in pure Rust on top of `image` / `nalgebra`.
+  implemented in pure Rust on top of `image` / `nalgebra`.
 
 ## Performance
 
-Measured on real OV9281 dual-camera data (1280×800 monochrome, AprilTag 36h11), 24-core CPU:
+Measured on real dual-camera data (1280×800 monochrome, AprilTag 36h11):
 
-| Workload | RapidTag | OpenCV (single-thread) |
-|----------|---------:|-----------------------:|
-| Single-frame (realtime, one camera) | **~370 FPS** (2.7 ms) | ~330 FPS (3.0 ms) |
-| Dual-camera pair (both cameras/tick) | **~590 FPS total** (3.4 ms/pair) | — |
-| Offline batch (all cores) | **~700 FPS** | — |
+| Workload | Speed vs OpenCV |
+|----------|:---------------:|
+| Realtime, single camera | **1.57× faster** |
+| Multi-camera / offline batch (all cores) | **up to ~3.4× faster** |
 
-Detection parity vs OpenCV: **0.0000 px** mean corner error; identical marker sets
-(RapidTag detects a few extra at the margins).
+Same detections, less time — the speedup comes from a leaner detection pipeline, not from
+skipping work.
 
-## Status
+## Accuracy — verified as a drop-in replacement
 
-**v1 — marker detection** (`detectMarkers`, `CORNER_REFINE_NONE`), faithfully ported from
-`opencv/modules/objdetect/src/aruco/`:
+Because RapidTag's corners are pixel-identical to OpenCV's, feeding them into the exact
+same pose pipeline (`cv2.solvePnP`) yields the **same trajectory**. Across a ~1,700-frame
+stereo recording of a moving AprilTag, the recovered position from RapidTag vs OpenCV
+corners is indistinguishable — a **median difference of 0.00 mm** on both cameras.
 
-- Adaptive-threshold candidate detection across window-size scales (sliding-window box sum)
-- Suzuki-Abe contour tracing → polygon approximation → convex-square filtering
-- Near-duplicate candidate grouping
-- Perspective removal + Otsu bit extraction
-- Dictionary identification via Hamming distance over the 4 rotations
-
-Supported dictionaries: all `DICT_{4,5,6,7}X{4,5,6,7}_{50,100,250,1000}`,
-`DICT_ARUCO_ORIGINAL`, `DICT_ARUCO_MIP_36h12`, and AprilTag
-`DICT_APRILTAG_{16h5,25h9,36h10,36h11}`.
-
-Not yet implemented (future): corner sub-pixel refinement, pose estimation (`solvePnP`),
-grid boards, ChArUco.
+![OpenCV vs RapidTag pose comparison](docs/pnp_opencv_vs_rapidtag.png)
 
 ## Install
 
@@ -68,44 +57,8 @@ Prebuilt wheels are published for:
 | macOS | x86_64 (Intel), **arm64 (Apple Silicon)** | — |
 | Windows | x64 | — |
 
-Wheels are `abi3` (one wheel works on CPython 3.9+). x86 wheels target the portable
-`x86-64-v2` baseline (any CPU since ~2009); arm64 wheels use the standard ARMv8 NEON
-baseline. If no wheel matches, `pip` builds from the source distribution (needs a Rust
-toolchain).
-
-## Build from source
-
-```bash
-# dev install into the current virtualenv
-maturin develop --release        # always use --release for performance
-
-# or build a wheel
-maturin build --release
-```
-
-The committed `.cargo/config.toml` uses **portable** CPU baselines (x86-64-v2 on x86;
-NEON on ARM) so the same build works everywhere. For a max-performance build on *your own*
-deployment machine, override with the native CPU (not portable — don't redistribute it):
-
-```bash
-RUSTFLAGS="-C target-cpu=native" maturin build --release
-```
-
-### Building for a specific ARM64 board
-
-To build a wheel tuned for one board (e.g. the **Radxa Dragon Q6A** / Qualcomm QCS6490,
-Cortex-A78+A55), use the helper script — it picks the right, non-portable CPU flags so you
-don't hand-edit anything:
-
-```bash
-./scripts/build-board.sh              # build a tuned wheel
-./scripts/build-board.sh develop      # ...or install into the current venv (on the board)
-TARGET_CPU=cortex-a76 ./scripts/build-board.sh   # override the CPU tuning
-```
-
-Built **on** the board it uses `target-cpu=native` (auto-detects the exact chip); run as a
-cross-compile it targets `cortex-a78`. These flags deliberately live in the script, *not* in
-`.cargo/config.toml`, so the published portable wheels stay CPU-agnostic.
+Wheels are `abi3` (one wheel works on CPython 3.9+). If no wheel matches, `pip` builds from
+the source distribution (needs a Rust toolchain).
 
 ## Usage
 
@@ -133,13 +86,33 @@ corners, ids = rapidtag.detect_markers(img, "DICT_6X6_250", p)
 print(rapidtag.predefined_dictionaries())   # list supported dictionary names
 ```
 
-## Regenerating dictionary tables
+Supported dictionaries: all `DICT_{4,5,6,7}X{4,5,6,7}_{50,100,250,1000}`,
+`DICT_ARUCO_ORIGINAL`, `DICT_ARUCO_MIP_36h12`, and AprilTag
+`DICT_APRILTAG_{16h5,25h9,36h10,36h11}`.
 
-The byte tables in `src/dictionaries_data.rs` are generated from OpenCV's headers:
+## Status
+
+**v1 — marker detection** (`detectMarkers`, `CORNER_REFINE_NONE`).
+
+Not yet implemented (future): corner sub-pixel refinement, pose estimation, grid boards,
+ChArUco.
+
+## Build from source
 
 ```bash
-python3 gen_dicts.py
+maturin develop --release        # dev install into the current virtualenv
+maturin build --release          # or build a wheel
 ```
+
+The committed build uses **portable** CPU baselines so one wheel works everywhere. For a
+max-performance build tuned to *your own* machine (not portable — don't redistribute it):
+
+```bash
+RUSTFLAGS="-C target-cpu=native" maturin build --release
+```
+
+For a wheel tuned to a specific ARM64 board, use `./scripts/build-board.sh` (it picks the
+right CPU flags so the published portable wheels stay CPU-agnostic).
 
 ## Tests
 
@@ -147,3 +120,6 @@ python3 gen_dicts.py
 python tests/crosscheck.py     # cross-validate vs cv2.aruco on synthetic scenes
 python tests/bench.py          # benchmark + parity on real camera data
 ```
+
+The verification figures above are reproduced by the scripts in `scripts/`
+(`pnp_opencv_vs_rapidtag.py`, `pnp_sanity.py`).

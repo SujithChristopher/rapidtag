@@ -9,7 +9,18 @@
 //! border-start conditions match imageproc exactly, so downstream output is
 //! identical.
 
-use image::GrayImage;
+// Label alphabet (i8, not i32): the Suzuki-Abe NBD *magnitude* is only used for
+// hierarchy, which the aruco pipeline discards — so we never need distinct
+// per-contour ids, only to mark visited pixels and keep the +/- sign that the
+// border-start test relies on. Collapsing to {0,FG,POS,NEG} shrinks this buffer
+// 4x (the dominant cost is streaming it, not the tracing).
+//
+// FG is `pub` because the adaptive threshold writes the foreground mask straight
+// into this same padded buffer (fused, no separate 0/255 image), so it must agree
+// on the foreground marker value.
+pub const FG: i8 = 1; // unlabeled foreground
+const POS: i8 = 2; // traced, positive (interior-capable)
+const NEG: i8 = -2; // traced, negative (right edge)
 
 // 8-neighborhood offsets, in imageproc's order (index == search position).
 const DIRS: [(i32, i32); 8] = [
@@ -38,58 +49,54 @@ fn dir_index(d: (i32, i32)) -> usize {
     }
 }
 
-/// Trace all borders of foreground (non-zero) regions in a binary image, invoking
-/// `f` once per contour with the ordered pixel coordinates in a *reused* buffer.
+/// Trace all borders of foreground regions, invoking `f` once per contour with the
+/// ordered pixel coordinates in a *reused* buffer.
 ///
-/// The buffer is borrowed only for the duration of each call — the caller copies
-/// out what it needs. This avoids allocating a `Vec` per contour, which matters
+/// `lbl` is a 1-pixel zero-padded label buffer (stride `w+2`, height `h+2`) that the
+/// adaptive threshold has already filled: `FG` at foreground pixels, `0` everywhere
+/// else including the border ring. Fusing the binarize into the threshold this way
+/// saves a whole full-image pass and the separate 0/255 image. The buffer is
+/// consumed (mutated in place with trace labels); the caller hands over ownership.
+///
+/// The per-contour buffer is borrowed only for the duration of each call — the caller
+/// copies out what it needs. This avoids allocating a `Vec` per contour, which matters
 /// because a thresholded frame contains hundreds of tiny noise contours that the
 /// aruco size filter immediately discards.
-pub fn for_each_contour<F: FnMut(&[(i32, i32)])>(thresh: &GrayImage, mut f: F) {
-    let w = thresh.width() as i32;
-    let h = thresh.height() as i32;
+pub fn for_each_contour<F: FnMut(&[(i32, i32)])>(lbl: &mut [i8], w: i32, h: i32, mut f: F) {
     if w == 0 || h == 0 {
         return;
     }
     let stride = (w + 2) as usize;
-    let mut lbl = vec![0i32; stride * (h + 2) as usize];
-    let src = thresh.as_raw();
+    debug_assert_eq!(lbl.len(), stride * (h + 2) as usize);
 
     // padded index for a real coordinate; valid for x in [-1, w], y in [-1, h]
     let idx = |x: i32, y: i32| -> usize { (y + 1) as usize * stride + (x + 1) as usize };
 
-    // binarize into the padded buffer (1 = unlabeled foreground)
-    for y in 0..h {
-        let row = &src[(y * w) as usize..(y * w + w) as usize];
-        let base = (y + 1) as usize * stride + 1;
-        for x in 0..w as usize {
-            if row[x] > 0 {
-                lbl[base + x] = 1;
-            }
-        }
-    }
-
     let max_points = (w as usize) * (h as usize) + 1; // hang guard
     let mut points: Vec<(i32, i32)> = Vec::new(); // reused across contours
-    let mut nbd = 1i32;
 
     for y in 0..h {
-        for x in 0..w {
-            let v = lbl[idx(x, y)];
+        // Row base for real x=0. The 1px pad guarantees `row_base-1` and
+        // `row_base + (w-1) + 1` are in-bounds, so left/right neighbours need no
+        // edge test. Reading a contiguous row slice lets the zero-skip vectorize.
+        let row_base = (y + 1) as usize * stride + 1;
+        for x in 0..w as usize {
+            let v = lbl[row_base + x];
             if v == 0 {
                 continue;
             }
             // border start: outer (unlabeled fg with background to the left) or
-            // hole (fg with background to the right)
-            let adj = if v == 1 && x > 0 && lbl[idx(x - 1, y)] == 0 {
-                (x - 1, y)
-            } else if v > 0 && x + 1 < w && lbl[idx(x + 1, y)] == 0 {
-                (x + 1, y)
+            // hole (fg with background to the right). The x>0 / x+1<w guards match
+            // imageproc exactly — the image edge itself is NOT treated as a
+            // background neighbour here, so we cannot lean on the zero pad.
+            let adj = if v == FG && x > 0 && lbl[row_base + x - 1] == 0 {
+                (x as i32 - 1, y)
+            } else if v > 0 && x + 1 < w as usize && lbl[row_base + x + 1] == 0 {
+                (x as i32 + 1, y)
             } else {
                 continue;
             };
-            nbd += 1;
-            let curr = (x, y);
+            let curr = (x as i32, y);
 
             // pos1: first non-zero neighbor, searching clockwise from `adj`
             let d0 = dir_index((adj.0 - curr.0, adj.1 - curr.1));
@@ -106,8 +113,8 @@ pub fn for_each_contour<F: FnMut(&[(i32, i32)])>(thresh: &GrayImage, mut f: F) {
             match pos1 {
                 None => {
                     // isolated pixel
-                    points.push((x, y));
-                    lbl[idx(x, y)] = -nbd;
+                    points.push(curr);
+                    lbl[row_base + x] = NEG;
                 }
                 Some(pos1) => {
                     let mut pos2 = pos1;
@@ -141,9 +148,9 @@ pub fn for_each_contour<F: FnMut(&[(i32, i32)])>(thresh: &GrayImage, mut f: F) {
                         }
 
                         if pos3.0 + 1 == w || is_right_edge {
-                            lbl[idx(pos3.0, pos3.1)] = -nbd;
-                        } else if lbl[idx(pos3.0, pos3.1)] == 1 {
-                            lbl[idx(pos3.0, pos3.1)] = nbd;
+                            lbl[idx(pos3.0, pos3.1)] = NEG;
+                        } else if lbl[idx(pos3.0, pos3.1)] == FG {
+                            lbl[idx(pos3.0, pos3.1)] = POS;
                         }
 
                         if pos4 == curr && pos3 == pos1 {

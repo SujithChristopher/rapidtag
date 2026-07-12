@@ -1,0 +1,22 @@
+[package]
+name = "fasttag"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "fasttag"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+numpy = "0.22"
+ndarray = "0.16"
+image = { version = "0.25", default-features = false }
+imageproc = { version = "0.25", default-features = false }
+nalgebra = "0.33"
+rayon = "1.10"
+mimalloc = { version = "0.1", default-features = false }
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -1,0 +1,129 @@
+name: Release
+
+# Build wheels for every platform/arch and publish to PyPI on a version tag.
+#
+# Trigger a release by pushing a tag:  git tag v0.1.0 && git push origin v0.1.0
+# You can also run it manually (Actions -> Release -> Run workflow) to test the
+# build matrix without publishing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ---- Linux: x86_64 + arm64 (aarch64), both glibc (manylinux) and musl (Alpine) ----
+  #
+  # aarch64 builds run on GitHub's native ARM runners (ubuntu-24.04-arm), which are
+  # free for public repositories and more reliable than cross-compiling. If this repo
+  # is PRIVATE (ARM runners are paid there), swap `ubuntu-24.04-arm` for `ubuntu-latest`
+  # — maturin-action will cross-compile aarch64 via its manylinux container instead.
+  linux:
+    runs-on: ${{ matrix.plat.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        plat:
+          - { runner: ubuntu-latest,    target: x86_64,  manylinux: auto }
+          - { runner: ubuntu-latest,    target: x86_64,  manylinux: musllinux_1_2 }
+          - { runner: ubuntu-24.04-arm, target: aarch64, manylinux: auto }
+          - { runner: ubuntu-24.04-arm, target: aarch64, manylinux: musllinux_1_2 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.plat.target }}
+          # abi3 → one wheel covers Python 3.9+.
+          args: --release --out dist
+          sccache: "true"
+          manylinux: ${{ matrix.plat.manylinux }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.plat.target }}-${{ matrix.plat.manylinux }}
+          path: dist
+
+  # ---- macOS: Intel (x86_64) + Apple Silicon (aarch64/NEON) ----
+  macos:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          sccache: "true"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist
+
+  # ---- Windows: x64 ----
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x64
+          args: --release --out dist
+          sccache: "true"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-x64
+          path: dist
+
+  # ---- Source distribution (lets users build from source if no wheel matches) ----
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+
+  # ---- Publish to PyPI via Trusted Publishing (OIDC) — only on version tags ----
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [linux, macos, windows, sdist]
+    environment:
+      name: pypi
+      url: https://pypi.org/p/rapidtag
+    permissions:
+      id-token: write # required for OIDC trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

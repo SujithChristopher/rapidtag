@@ -1,0 +1,13 @@
+RapidTag
+Copyright 2026 Sujith Christopher
+
+This product includes software derived from OpenCV (https://opencv.org),
+which is licensed under the Apache License, Version 2.0.
+
+Specifically, the ArUco / AprilTag detection algorithm and the predefined
+marker dictionary tables in src/dictionaries_data.rs are reimplemented and
+generated from OpenCV's objdetect module
+(opencv/modules/objdetect/src/aruco). See:
+
+    https://github.com/opencv/opencv
+    Copyright (C) 2000-2024, OpenCV contributors.

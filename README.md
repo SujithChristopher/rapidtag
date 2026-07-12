@@ -48,7 +48,26 @@ Supported dictionaries: all `DICT_{4,5,6,7}X{4,5,6,7}_{50,100,250,1000}`,
 Not yet implemented (future): corner sub-pixel refinement, pose estimation (`solvePnP`),
 grid boards, ChArUco.
 
-## Install / build
+## Install
+
+```bash
+pip install rapidtag
+```
+
+Prebuilt wheels are published for:
+
+| OS | Architectures | libc |
+|----|---------------|------|
+| Linux | x86_64, **aarch64 (arm64)** | glibc (manylinux) + musl (Alpine) |
+| macOS | x86_64 (Intel), **arm64 (Apple Silicon)** | — |
+| Windows | x64 | — |
+
+Wheels are `abi3` (one wheel works on CPython 3.9+). x86 wheels target the portable
+`x86-64-v2` baseline (any CPU since ~2009); arm64 wheels use the standard ARMv8 NEON
+baseline. If no wheel matches, `pip` builds from the source distribution (needs a Rust
+toolchain).
+
+## Build from source
 
 ```bash
 # dev install into the current virtualenv

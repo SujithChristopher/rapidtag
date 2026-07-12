@@ -8,10 +8,25 @@ version = "0.1.0"
 description = "RapidTag — fast realtime fiducial marker (ArUco/AprilTag) detection in Rust"
 readme = "README.md"
 requires-python = ">=3.9"
+license = "Apache-2.0"
+authors = [{ name = "Sujith Christopher", email = "sujith.christopher52@gmail.com" }]
+keywords = ["aruco", "apriltag", "fiducial", "marker", "detection", "computer-vision", "realtime", "rust"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Image Recognition",
     "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: Implementation :: CPython",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
 ]
+
+[project.urls]
+Homepage = "https://github.com/SujithChristopher/rapidtag"
+Repository = "https://github.com/SujithChristopher/rapidtag"
+Issues = "https://github.com/SujithChristopher/rapidtag/issues"
 
 [project.optional-dependencies]
 dev = ["numpy", "opencv-contrib-python", "pytest"]

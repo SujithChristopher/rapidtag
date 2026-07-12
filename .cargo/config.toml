@@ -1,5 +1,15 @@
-# Optimize for the build machine's CPU (enables AVX2/AVX-512 where available).
-# NOTE: the resulting binary is not portable to older CPUs. For distributable
-# wheels use a baseline like target-feature=+avx2 or target-cpu=x86-64-v3.
-[build]
-rustflags = ["-C", "target-cpu=native"]
+# Portable SIMD baseline for distributed wheels.
+#
+# x86-64-v2 = SSE4.2 / POPCNT, supported by essentially every x86-64 CPU since
+# ~2009. It still enables 128-bit SIMD autovectorization (keeps most of our
+# threshold speedup) while remaining safe to run anywhere. Applied only to
+# x86_64; aarch64 (Apple Silicon, ARM servers) uses its NEON baseline, which is
+# always present, so no flag is needed there.
+#
+# For a MAX-PERFORMANCE build on your own deployment machine, override with the
+# native CPU (not portable — do not ship the resulting wheel):
+#   RUSTFLAGS="-C target-cpu=native" maturin develop --release
+#
+# For modern-only fleets you can bump this to x86-64-v3 (AVX2, ~2013+).
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v2"]

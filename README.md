@@ -80,6 +80,35 @@ Prebuilt wheels are published for:
 Wheels are `abi3` (one wheel works on CPython 3.9+). If no wheel matches, `pip` builds from
 the source distribution (needs a Rust toolchain).
 
+### Building from source in your own project (opt-in)
+
+By default `uv add rapidtag` / `pip install rapidtag` install the **prebuilt portable
+wheel** — no Rust toolchain needed. There is no package-side flag or extra (e.g.
+`rapidtag[native]`) that changes this; forcing a source build is always an installer-side
+opt-in on *your* side, and it needs a Rust toolchain (`rustc`/`cargo`) installed.
+
+To make your project always compile rapidtag from source, add this to *your*
+`pyproject.toml` **before** installing:
+
+```toml
+[tool.uv]
+no-binary-package = ["rapidtag"]
+```
+
+Then, to get CPU-native codegen for the machine you're installing on, set `RUSTFLAGS` at
+install time:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" uv sync
+```
+
+Without `RUSTFLAGS` this still compiles a **portable** binary — functionally the same as
+the prebuilt wheel, just slower to install. The `target-cpu=native` build is not portable;
+don't redistribute it.
+
+pip equivalents: `pip install rapidtag --no-binary rapidtag`, optionally prefixed with the
+same `RUSTFLAGS`.
+
 ## Usage
 
 ```python

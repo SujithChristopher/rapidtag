@@ -34,6 +34,26 @@ Measured on real dual-camera data (1280×800 monochrome, AprilTag 36h11):
 Same detections, less time — the speedup comes from a leaner detection pipeline, not from
 skipping work.
 
+### Heterogeneous (big.LITTLE) ARM CPUs
+
+On big.LITTLE SoCs, RapidTag pins its worker pool to the fast cores automatically.
+Every detect call waits on its slowest parallel task, so letting the OS place even one
+task on a little core caps the whole batch at little-core speed — on a Radxa Dragon Q6A
+(QCS6490: 4× A55 @1.9 GHz + 4× A78 @2.4–2.7 GHz) auto-pinning takes a single
+1280×800 detect from 68 fps to 211 fps, and a dual-camera pair from 66 to 134 pairs/s.
+The calling thread and any capture/IO threads are left unpinned, keeping the little
+cores for them. Homogeneous CPUs and non-Linux hosts are unaffected.
+
+Override with `RAPIDTAG_CORES`: an explicit core list (`4-7`, `0,2,4`) or `all` to
+disable pinning. `RAYON_NUM_THREADS` still controls pool size when set.
+
+Two further board-level settings are worth it on embedded targets:
+
+* build for the exact CPU with `scripts/build-board.sh` (`-C target-cpu=native`)
+* switch the fast cores' cpufreq governor to `performance` — bursty per-frame work
+  never keeps `schedutil` clocked up (on the Q6A this is another ~1.7×:
+  123 → 211 fps single, 102 → 134 pairs/s dual)
+
 ## Accuracy — verified as a drop-in replacement
 
 Because RapidTag's corners are pixel-identical to OpenCV's, feeding them into the exact

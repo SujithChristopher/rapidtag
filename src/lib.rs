@@ -1,6 +1,7 @@
 //! RapidTag — fast, pure-Rust fiducial marker detection for realtime use,
 //! exposed to Python via PyO3/maturin. v1: detectMarkers (CORNER_REFINE_NONE).
 
+mod affinity;
 mod contours;
 mod detector;
 #[allow(non_upper_case_globals)]
@@ -215,6 +216,9 @@ fn detect_markers_batch(
 
 #[pymodule]
 fn rapidtag(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // On big.LITTLE ARM, pin the detect worker pool to the fast cores before
+    // rayon spins up — see affinity.rs (RAPIDTAG_CORES overrides/disables).
+    affinity::init_pool();
     m.add_class::<PyDetectorParameters>()?;
     m.add_function(wrap_pyfunction!(detect_markers, m)?)?;
     m.add_function(wrap_pyfunction!(detect_markers_batch, m)?)?;

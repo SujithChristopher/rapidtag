@@ -1,5 +1,13 @@
 # RapidTag
 
+[![PyPI version](https://img.shields.io/pypi/v/rapidtag.svg)](https://pypi.org/project/rapidtag/)
+[![Python versions](https://img.shields.io/pypi/pyversions/rapidtag.svg)](https://pypi.org/project/rapidtag/)
+[![Wheels](https://img.shields.io/pypi/wheel/rapidtag.svg)](https://pypi.org/project/rapidtag/#files)
+[![License: Apache-2.0](https://img.shields.io/pypi/l/rapidtag.svg)](https://github.com/SujithChristopher/rapidtag/blob/master/LICENSE)
+[![Release](https://github.com/SujithChristopher/rapidtag/actions/workflows/release.yml/badge.svg)](https://github.com/SujithChristopher/rapidtag/actions/workflows/release.yml)
+[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-000000.svg?logo=rust)](https://www.rust-lang.org/)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://pypi.org/project/rapidtag/#files)
+
 > ⚠️ **Work in progress — not production-ready.** RapidTag is under active development
 > and pre-1.0. APIs, behavior, and results may change without notice. Use it for research,
 > evaluation, and prototyping, and validate it against your own data before relying on it

@@ -1,9 +1,10 @@
 //! RapidTag — fast, pure-Rust fiducial marker detection for realtime use,
 //! exposed to Python via PyO3/maturin.
 //!
-//! Ported so far: detectMarkers (CORNER_REFINE_NONE) and CharucoDetector::detectBoard
-//! (local-homography path). Not yet ported: solvePnP and the approxCalib path that
-//! needs it, refineDetectedMarkers, findChessboardCorners, and calibration.
+//! Ported so far: detectMarkers (CORNER_REFINE_NONE), CharucoDetector::detectBoard
+//! (local-homography path), and solvePnP (SOLVEPNP_ITERATIVE) with Rodrigues,
+//! projectPoints and undistortPoints. Not yet ported: refineDetectedMarkers,
+//! findChessboardCorners, the charuco approxCalib path, and calibration.
 
 mod affinity;
 mod board;
@@ -20,6 +21,7 @@ mod dictionaries_data;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod dictionary;
 mod imgproc;
+mod pnp;
 
 use detector::DetectorParameters;
 use numpy::PyReadonlyArrayDyn;
@@ -320,6 +322,172 @@ fn detect_charuco_board(
     Ok((corners, res.ids, marker_corners, res.marker_ids))
 }
 
+/// Parse a 3x3 camera matrix and distortion vector from Python sequences.
+fn parse_camera(
+    camera_matrix: Vec<Vec<f64>>,
+    dist_coeffs: Option<Vec<f64>>,
+) -> PyResult<(pnp::Camera, pnp::Distortion)> {
+    if camera_matrix.len() != 3 || camera_matrix.iter().any(|r| r.len() != 3) {
+        return Err(PyValueError::new_err("camera_matrix must be 3x3"));
+    }
+    let mut m = [0f64; 9];
+    for i in 0..3 {
+        for j in 0..3 {
+            m[i * 3 + j] = camera_matrix[i][j];
+        }
+    }
+    let dist = pnp::Distortion::from_slice(&dist_coeffs.unwrap_or_default())
+        .map_err(PyValueError::new_err)?;
+    Ok((pnp::Camera::from_matrix(&m), dist))
+}
+
+/// Estimate the pose of a set of 3D-2D correspondences (cv::solvePnP,
+/// SOLVEPNP_ITERATIVE).
+///
+/// `object_points` are Nx3 in board/world coordinates, `image_points` Nx2 in
+/// pixels. Returns `(rvec, tvec)` as 3-element lists, or None if the solve fails.
+/// Pass `rvec`/`tvec` to seed the optimisation (OpenCV's `useExtrinsicGuess`).
+#[pyfunction]
+#[pyo3(signature = (object_points, image_points, camera_matrix, dist_coeffs=None, rvec=None, tvec=None))]
+fn solve_pnp(
+    object_points: Vec<[f64; 3]>,
+    image_points: Vec<[f64; 2]>,
+    camera_matrix: Vec<Vec<f64>>,
+    dist_coeffs: Option<Vec<f64>>,
+    rvec: Option<[f64; 3]>,
+    tvec: Option<[f64; 3]>,
+) -> PyResult<Option<(Vec<f64>, Vec<f64>)>> {
+    if object_points.len() != image_points.len() {
+        return Err(PyValueError::new_err(
+            "object_points and image_points must have the same length",
+        ));
+    }
+    if object_points.len() < 4 {
+        return Err(PyValueError::new_err("need at least 4 point correspondences"));
+    }
+    let (cam, dist) = parse_camera(camera_matrix, dist_coeffs)?;
+    let obj: Vec<pnp::Pt3d> = object_points.iter().map(|p| (p[0], p[1], p[2])).collect();
+    let img: Vec<pnp::Pt2d> = image_points.iter().map(|p| (p[0], p[1])).collect();
+    let guess = match (rvec, tvec) {
+        (Some(r), Some(t)) => Some((r, t)),
+        (None, None) => None,
+        _ => {
+            return Err(PyValueError::new_err(
+                "rvec and tvec must be supplied together",
+            ))
+        }
+    };
+    Ok(pnp::solve_pnp(&obj, &img, &cam, &dist, guess).map(|(r, t)| (r.to_vec(), t.to_vec())))
+}
+
+/// Project 3D object points into the image (cv::projectPoints).
+#[pyfunction]
+#[pyo3(signature = (object_points, rvec, tvec, camera_matrix, dist_coeffs=None))]
+fn project_points(
+    object_points: Vec<[f64; 3]>,
+    rvec: [f64; 3],
+    tvec: [f64; 3],
+    camera_matrix: Vec<Vec<f64>>,
+    dist_coeffs: Option<Vec<f64>>,
+) -> PyResult<Vec<[f64; 2]>> {
+    let (cam, dist) = parse_camera(camera_matrix, dist_coeffs)?;
+    let obj: Vec<pnp::Pt3d> = object_points.iter().map(|p| (p[0], p[1], p[2])).collect();
+    let (pts, _) = pnp::project_points(&obj, rvec, tvec, &cam, &dist, false);
+    Ok(pts.iter().map(|p| [p.0, p.1]).collect())
+}
+
+/// Convert a rotation vector to a 3x3 rotation matrix, or back (cv::Rodrigues).
+#[pyfunction]
+fn rodrigues(src: Vec<Vec<f64>>) -> PyResult<Vec<Vec<f64>>> {
+    match (src.len(), src.first().map(|r| r.len())) {
+        (3, Some(1)) => {
+            let r = [src[0][0], src[1][0], src[2][0]];
+            let (m, _) = pnp::rodrigues_v2m(r, false);
+            Ok((0..3).map(|i| m[i * 3..i * 3 + 3].to_vec()).collect())
+        }
+        (1, Some(3)) => {
+            let r = [src[0][0], src[0][1], src[0][2]];
+            let (m, _) = pnp::rodrigues_v2m(r, false);
+            Ok((0..3).map(|i| m[i * 3..i * 3 + 3].to_vec()).collect())
+        }
+        (3, Some(3)) => {
+            let mut m = [0f64; 9];
+            for i in 0..3 {
+                for j in 0..3 {
+                    m[i * 3 + j] = src[i][j];
+                }
+            }
+            let r = pnp::rodrigues_m2v(&m);
+            Ok(r.iter().map(|&v| vec![v]).collect())
+        }
+        _ => Err(PyValueError::new_err(
+            "src must be 3x1 / 1x3 (rotation vector) or 3x3 (rotation matrix)",
+        )),
+    }
+}
+
+/// Estimate the pose of a ChArUco board from detected chessboard corners
+/// (cv::aruco::estimatePoseCharucoBoard).
+///
+/// `charuco_ids` index into `board.chessboard_corners`. Returns `(rvec, tvec)`
+/// or None if the pose could not be estimated (fewer than 4 corners, or the
+/// corners are collinear).
+#[pyfunction]
+#[pyo3(signature = (charuco_corners, charuco_ids, board, camera_matrix, dist_coeffs=None))]
+fn estimate_pose_charuco_board(
+    charuco_corners: Vec<[f64; 2]>,
+    charuco_ids: Vec<usize>,
+    board: &PyCharucoBoard,
+    camera_matrix: Vec<Vec<f64>>,
+    dist_coeffs: Option<Vec<f64>>,
+) -> PyResult<Option<(Vec<f64>, Vec<f64>)>> {
+    if charuco_corners.len() != charuco_ids.len() {
+        return Err(PyValueError::new_err(
+            "charuco_corners and charuco_ids must have the same length",
+        ));
+    }
+    if charuco_corners.len() < 4 {
+        return Ok(None);
+    }
+    let (cam, dist) = parse_camera(camera_matrix, dist_coeffs)?;
+    let cc = &board.inner.chessboard_corners;
+    let mut obj: Vec<pnp::Pt3d> = Vec::with_capacity(charuco_ids.len());
+    for &id in &charuco_ids {
+        let p = cc
+            .get(id)
+            .ok_or_else(|| PyValueError::new_err(format!("charuco id {id} out of range")))?;
+        obj.push((p.0 as f64, p.1 as f64, p.2 as f64));
+    }
+    // A ChArUco board is planar, so collinear corners leave the pose undetermined.
+    if collinear(&obj) {
+        return Ok(None);
+    }
+    let img: Vec<pnp::Pt2d> = charuco_corners.iter().map(|p| (p[0], p[1])).collect();
+    Ok(pnp::solve_pnp(&obj, &img, &cam, &dist, None).map(|(r, t)| (r.to_vec(), t.to_vec())))
+}
+
+/// True if all board points lie on one line (mirrors OpenCV's collinearity guard).
+fn collinear(pts: &[pnp::Pt3d]) -> bool {
+    if pts.len() < 3 {
+        return true;
+    }
+    let (x0, y0) = (pts[0].0, pts[0].1);
+    let (mut dx, mut dy) = (0.0, 0.0);
+    for p in &pts[1..] {
+        if (p.0 - x0).abs() > 1e-9 || (p.1 - y0).abs() > 1e-9 {
+            dx = p.0 - x0;
+            dy = p.1 - y0;
+            break;
+        }
+    }
+    if dx == 0.0 && dy == 0.0 {
+        return true;
+    }
+    let len = (dx * dx + dy * dy).sqrt();
+    pts.iter()
+        .all(|p| ((p.0 - x0) * dy - (p.1 - y0) * dx).abs() / len < 1e-6)
+}
+
 /// Test hook: interpolated charuco corners and window sizes, pre-refinement.
 #[pyfunction]
 fn _charuco_predict(
@@ -368,6 +536,10 @@ fn rapidtag(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(detect_charuco_board, m)?)?;
     m.add_function(wrap_pyfunction!(predefined_dictionaries, m)?)?;
     m.add_function(wrap_pyfunction!(_corner_sub_pix, m)?)?;
+    m.add_function(wrap_pyfunction!(solve_pnp, m)?)?;
+    m.add_function(wrap_pyfunction!(project_points, m)?)?;
+    m.add_function(wrap_pyfunction!(rodrigues, m)?)?;
+    m.add_function(wrap_pyfunction!(estimate_pose_charuco_board, m)?)?;
     m.add_function(wrap_pyfunction!(_charuco_predict, m)?)?;
     Ok(())
 }

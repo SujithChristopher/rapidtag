@@ -1,8 +1,15 @@
 //! RapidTag — fast, pure-Rust fiducial marker detection for realtime use,
-//! exposed to Python via PyO3/maturin. v1: detectMarkers (CORNER_REFINE_NONE).
+//! exposed to Python via PyO3/maturin.
+//!
+//! Ported so far: detectMarkers (CORNER_REFINE_NONE) and CharucoDetector::detectBoard
+//! (local-homography path). Not yet ported: solvePnP and the approxCalib path that
+//! needs it, refineDetectedMarkers, findChessboardCorners, and calibration.
 
 mod affinity;
+mod board;
+mod charuco;
 mod contours;
+mod cornersubpix;
 mod detector;
 #[allow(non_upper_case_globals)]
 mod dictionaries_data;
@@ -214,14 +221,153 @@ fn detect_markers_batch(
     Ok(results.into_iter().map(|(dets, _)| to_result(dets)).collect())
 }
 
+/// A ChArUco board: a chessboard with ArUco markers in its white squares.
+///
+/// The board precomputes its own geometry, so build it once and reuse it across
+/// frames rather than constructing it per call.
+#[pyclass(name = "CharucoBoard")]
+struct PyCharucoBoard {
+    inner: board::CharucoBoard,
+    dictionary: String,
+}
+
+#[pymethods]
+impl PyCharucoBoard {
+    #[new]
+    #[pyo3(signature = (squares_x, squares_y, square_length, marker_length, dictionary, ids=None, legacy_pattern=false))]
+    fn new(
+        squares_x: usize,
+        squares_y: usize,
+        square_length: f32,
+        marker_length: f32,
+        dictionary: &str,
+        ids: Option<Vec<usize>>,
+        legacy_pattern: bool,
+    ) -> PyResult<Self> {
+        if dictionary::get_predefined_dictionary(dictionary).is_none() {
+            return Err(PyValueError::new_err(format!(
+                "unknown dictionary: {dictionary}"
+            )));
+        }
+        let inner = board::CharucoBoard::new(
+            squares_x,
+            squares_y,
+            square_length,
+            marker_length,
+            ids,
+            legacy_pattern,
+        )
+        .map_err(PyValueError::new_err)?;
+        Ok(PyCharucoBoard {
+            inner,
+            dictionary: dictionary.to_string(),
+        })
+    }
+
+    /// Interior chessboard corners in board coordinates, as (x, y, z) triples.
+    #[getter]
+    fn chessboard_corners(&self) -> Vec<[f32; 3]> {
+        self.inner
+            .chessboard_corners
+            .iter()
+            .map(|c| [c.0, c.1, c.2])
+            .collect()
+    }
+
+    /// Marker ids laid out on the board.
+    #[getter]
+    fn ids(&self) -> Vec<usize> {
+        self.inner.ids.clone()
+    }
+}
+
+/// Detect a ChArUco board in `image` (HxW grayscale or HxWx3 BGR, uint8).
+///
+/// Returns `(charuco_corners, charuco_ids, marker_corners, marker_ids)`:
+///   - `charuco_corners`: Nx2 sub-pixel refined chessboard corners
+///   - `charuco_ids`: index of each corner within `board.chessboard_corners`
+///   - `marker_corners` / `marker_ids`: the ArUco markers found along the way
+#[pyfunction]
+#[pyo3(signature = (image, board, parameters=None, min_markers=2, check_markers=true))]
+fn detect_charuco_board(
+    py: Python<'_>,
+    image: PyReadonlyArrayDyn<u8>,
+    board: &PyCharucoBoard,
+    parameters: Option<PyDetectorParameters>,
+    min_markers: i32,
+    check_markers: bool,
+) -> PyResult<(Vec<[f32; 2]>, Vec<usize>, Vec<[[f32; 2]; 4]>, Vec<i32>)> {
+    if !(0..=2).contains(&min_markers) {
+        return Err(PyValueError::new_err("min_markers must be 0, 1 or 2"));
+    }
+    let dict = dictionary::get_predefined_dictionary(&board.dictionary)
+        .ok_or_else(|| PyValueError::new_err(format!("unknown dictionary: {}", board.dictionary)))?;
+    let params = parameters.map(|p| p.inner).unwrap_or_default();
+    let cp = charuco::CharucoParameters {
+        min_markers,
+        check_markers,
+    };
+    let fd = extract_frame(&image)?;
+    let gray = imgproc::to_gray(fd.data, fd.h, fd.w, fd.ch);
+    let res = py.allow_threads(|| charuco::detect_board(&gray, &board.inner, &dict, &params, &cp));
+
+    let corners = res.corners.iter().map(|c| [c.0, c.1]).collect();
+    let marker_corners = res
+        .marker_corners
+        .iter()
+        .map(|q| [[q[0].0, q[0].1], [q[1].0, q[1].1], [q[2].0, q[2].1], [q[3].0, q[3].1]])
+        .collect();
+    Ok((corners, res.ids, marker_corners, res.marker_ids))
+}
+
+/// Test hook: interpolated charuco corners and window sizes, pre-refinement.
+#[pyfunction]
+fn _charuco_predict(
+    image: PyReadonlyArrayDyn<u8>,
+    board: &PyCharucoBoard,
+) -> PyResult<(Vec<[f32; 2]>, Vec<i32>)> {
+    let dict = dictionary::get_predefined_dictionary(&board.dictionary)
+        .ok_or_else(|| PyValueError::new_err("unknown dictionary"))?;
+    let params = DetectorParameters::default();
+    let fd = extract_frame(&image)?;
+    let gray = imgproc::to_gray(fd.data, fd.h, fd.w, fd.ch);
+    let (pts, wins) = charuco::debug_predict(&gray, &board.inner, &dict, &params);
+    Ok((pts.iter().map(|p| [p.0, p.1]).collect(), wins))
+}
+
+/// Test hook: run cornerSubPix directly so it can be compared against
+/// cv2.cornerSubPix on identical inputs. Not part of the public API.
+#[pyfunction]
+fn _corner_sub_pix(
+    image: PyReadonlyArrayDyn<u8>,
+    corners: Vec<[f32; 2]>,
+    win: usize,
+    max_iters: i32,
+    eps: f64,
+) -> PyResult<Vec<[f32; 2]>> {
+    let fd = extract_frame(&image)?;
+    let gray = imgproc::to_gray(fd.data, fd.h, fd.w, fd.ch);
+    Ok(corners
+        .iter()
+        .map(|c| {
+            let r = cornersubpix::corner_sub_pix(&gray, (c[0], c[1]), win, max_iters, eps);
+            [r.0, r.1]
+        })
+        .collect())
+}
+
 #[pymodule]
 fn rapidtag(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // On big.LITTLE ARM, pin the detect worker pool to the fast cores before
     // rayon spins up — see affinity.rs (RAPIDTAG_CORES overrides/disables).
     affinity::init_pool();
     m.add_class::<PyDetectorParameters>()?;
+    m.add_class::<PyCharucoBoard>()?;
     m.add_function(wrap_pyfunction!(detect_markers, m)?)?;
     m.add_function(wrap_pyfunction!(detect_markers_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_charuco_board, m)?)?;
     m.add_function(wrap_pyfunction!(predefined_dictionaries, m)?)?;
+    m.add_function(wrap_pyfunction!(_corner_sub_pix, m)?)?;
+    m.add_function(wrap_pyfunction!(_charuco_predict, m)?)?;
     Ok(())
 }

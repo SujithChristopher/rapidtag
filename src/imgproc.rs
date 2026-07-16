@@ -300,27 +300,33 @@ pub fn is_convex(pts: &[Pt]) -> bool {
 }
 
 /// Solve for the 3x3 perspective transform mapping src[i] -> dst[i]. Returns row-major H (h8=1).
+///
+/// The layout mirrors cv::getPerspectiveTransform exactly: the four x-equations
+/// occupy rows 0..4 and the y-equations rows 4..8. That grouping is not cosmetic —
+/// LU pivots on row order, so interleaving the equations changes the rounding of
+/// the result in its last bits.
 pub fn get_perspective_transform(src: &[Pt; 4], dst: &[Pt; 4]) -> [f64; 9] {
     let mut a = Matrix8::zeros();
     let mut b = Vector8::zeros();
     for i in 0..4 {
-        let (x, y) = (src[i].0 as f64, src[i].1 as f64);
-        let (u, v) = (dst[i].0 as f64, dst[i].1 as f64);
-        let r0 = 2 * i;
-        let r1 = 2 * i + 1;
-        a[(r0, 0)] = x;
-        a[(r0, 1)] = y;
-        a[(r0, 2)] = 1.0;
-        a[(r0, 6)] = -x * u;
-        a[(r0, 7)] = -y * u;
-        b[r0] = u;
+        let (x, y) = (src[i].0, src[i].1);
+        let (u, v) = (dst[i].0, dst[i].1);
+        // The -x*u style products are f32*f32 in OpenCV, so they round to f32
+        // before widening. Computing them in f64 would be more accurate but would
+        // not agree with the reference.
+        a[(i, 0)] = x as f64;
+        a[(i, 1)] = y as f64;
+        a[(i, 2)] = 1.0;
+        a[(i, 6)] = (-x * u) as f64;
+        a[(i, 7)] = (-y * u) as f64;
+        b[i] = u as f64;
 
-        a[(r1, 3)] = x;
-        a[(r1, 4)] = y;
-        a[(r1, 5)] = 1.0;
-        a[(r1, 6)] = -x * v;
-        a[(r1, 7)] = -y * v;
-        b[r1] = v;
+        a[(i + 4, 3)] = x as f64;
+        a[(i + 4, 4)] = y as f64;
+        a[(i + 4, 5)] = 1.0;
+        a[(i + 4, 6)] = (-x * v) as f64;
+        a[(i + 4, 7)] = (-y * v) as f64;
+        b[i + 4] = v as f64;
     }
     let h = a.lu().solve(&b).expect("perspective solve failed");
     [h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], 1.0]

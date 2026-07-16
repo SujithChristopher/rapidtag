@@ -27,6 +27,11 @@ pub struct DetectorParameters {
     pub detect_inverted_marker: bool,
     pub min_side_length_canonical_img: i32,
     pub valid_bit_id_threshold: f32,
+    /// Half-size of the cornerSubPix search window. Used by the ChArUco corner
+    /// refinement; marker corner refinement itself is still CORNER_REFINE_NONE.
+    pub corner_refinement_win_size: i32,
+    pub corner_refinement_max_iterations: i32,
+    pub corner_refinement_min_accuracy: f64,
 }
 
 impl Default for DetectorParameters {
@@ -51,6 +56,9 @@ impl Default for DetectorParameters {
             detect_inverted_marker: false,
             min_side_length_canonical_img: 32,
             valid_bit_id_threshold: DEFAULT_VALID_BIT_ID_THRESHOLD,
+            corner_refinement_win_size: 5,
+            corner_refinement_max_iterations: 30,
+            corner_refinement_min_accuracy: 0.1,
         }
     }
 }

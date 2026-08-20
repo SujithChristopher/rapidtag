@@ -141,6 +141,9 @@ p.detect_inverted_marker = True
 corners, ids = rapidtag.detect_markers(img, "DICT_6X6_250", p)
 
 print(rapidtag.predefined_dictionaries())   # list supported dictionary names
+
+# --- generic calibration chessboard (9 columns x 6 rows of interior corners) ---
+found, chessboard_corners = rapidtag.find_chessboard_corners(img, (9, 6))
 ```
 
 Supported dictionaries: all `DICT_{4,5,6,7}X{4,5,6,7}_{50,100,250,1000}`,
@@ -149,10 +152,15 @@ Supported dictionaries: all `DICT_{4,5,6,7}X{4,5,6,7}_{50,100,250,1000}`,
 
 ## Status
 
-**v1 — marker detection** (`detectMarkers`, `CORNER_REFINE_NONE`).
+Implemented:
 
-Not yet implemented (future): corner sub-pixel refinement, pose estimation, grid boards,
-ChArUco.
+- ArUco / AprilTag marker detection (`detectMarkers`, `CORNER_REFINE_NONE`)
+- Generic chessboard detection with sub-pixel corners (`findChessboardCorners`)
+- ChArUco board detection using local marker homographies
+- Iterative PnP, Rodrigues, point projection, and ChArUco board pose estimation
+
+Not yet implemented: marker-corner refinement, grid boards, camera calibration,
+`refineDetectedMarkers`, and ChArUco's camera-aware interpolation path.
 
 ## Build from source
 
@@ -175,6 +183,9 @@ right CPU flags so the published portable wheels stay CPU-agnostic).
 
 ```bash
 python tests/crosscheck.py     # cross-validate vs cv2.aruco on synthetic scenes
+python tests/crosscheck_chessboard.py  # generic chessboard parity vs OpenCV
+python tests/crosscheck_charuco.py     # ChArUco parity vs OpenCV
+python tests/crosscheck_pnp.py         # geometry and end-to-end pose parity
 python tests/bench.py          # benchmark + parity on real camera data
 ```
 

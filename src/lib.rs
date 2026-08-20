@@ -2,13 +2,14 @@
 //! exposed to Python via PyO3/maturin.
 //!
 //! Ported so far: detectMarkers (CORNER_REFINE_NONE), CharucoDetector::detectBoard
-//! (local-homography path), and solvePnP (SOLVEPNP_ITERATIVE) with Rodrigues,
-//! projectPoints and undistortPoints. Not yet ported: refineDetectedMarkers,
-//! findChessboardCorners, the charuco approxCalib path, and calibration.
+//! (local-homography path), findChessboardCorners, and solvePnP
+//! (SOLVEPNP_ITERATIVE) with Rodrigues, projectPoints and undistortPoints. Not
+//! yet ported: refineDetectedMarkers, the charuco approxCalib path, and calibration.
 
 mod affinity;
 mod board;
 mod charuco;
+mod chessboard;
 mod contours;
 mod cornersubpix;
 mod detector;
@@ -322,6 +323,32 @@ fn detect_charuco_board(
     Ok((corners, res.ids, marker_corners, res.marker_ids))
 }
 
+/// Find all interior corners of a generic black-and-white chessboard.
+///
+/// `pattern_size` is `(columns, rows)` of interior corners, matching OpenCV's
+/// `findChessboardCorners` convention. Returns `(found, corners)`, with corners
+/// in row-major order and refined to sub-pixel accuracy.
+#[pyfunction]
+fn find_chessboard_corners(
+    py: Python<'_>,
+    image: PyReadonlyArrayDyn<u8>,
+    pattern_size: (usize, usize),
+) -> PyResult<(bool, Vec<[f32; 2]>)> {
+    let (width, height) = pattern_size;
+    if width < 3 || height < 3 {
+        return Err(PyValueError::new_err(
+            "both pattern_size dimensions must be greater than 2",
+        ));
+    }
+    let fd = extract_frame(&image)?;
+    let gray = imgproc::to_gray(fd.data, fd.h, fd.w, fd.ch);
+    let result = py.allow_threads(|| chessboard::find_chessboard_corners(&gray, width, height));
+    match result {
+        Some(corners) => Ok((true, corners.into_iter().map(|p| [p.0, p.1]).collect())),
+        None => Ok((false, Vec::new())),
+    }
+}
+
 /// Parse a 3x3 camera matrix and distortion vector from Python sequences.
 fn parse_camera(
     camera_matrix: Vec<Vec<f64>>,
@@ -534,6 +561,7 @@ fn rapidtag(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(detect_markers, m)?)?;
     m.add_function(wrap_pyfunction!(detect_markers_batch, m)?)?;
     m.add_function(wrap_pyfunction!(detect_charuco_board, m)?)?;
+    m.add_function(wrap_pyfunction!(find_chessboard_corners, m)?)?;
     m.add_function(wrap_pyfunction!(predefined_dictionaries, m)?)?;
     m.add_function(wrap_pyfunction!(_corner_sub_pix, m)?)?;
     m.add_function(wrap_pyfunction!(solve_pnp, m)?)?;

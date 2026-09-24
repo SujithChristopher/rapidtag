@@ -172,6 +172,20 @@ if body_pose is not None:
     print(body_pose.used_marker_ids, body_pose.inlier_marker_ids)
 ```
 
+## Documentation
+
+- [Installation and source builds](docs/installation.md)
+- [Marker and ChArUco detection](docs/marker-detection.md)
+- [Pose estimation and RANSAC](docs/pose-estimation.md)
+- [Rigid-body multi-marker pose](docs/rigid-bodies.md)
+- [Radxa Dragon Q6A deployment](docs/q6a-deployment.md)
+- [Complete Python API reference](docs/python-api.md)
+- [Runnable examples](examples/)
+
+Python signatures are also shipped in `rapidtag.pyi` for IDEs and type checkers.
+Maintainers can build the internal Rust documentation with
+`cargo doc --no-deps --document-private-items --open`.
+
 Supported dictionaries: all `DICT_{4,5,6,7}X{4,5,6,7}_{50,100,250,1000}`,
 `DICT_ARUCO_ORIGINAL`, `DICT_ARUCO_MIP_36h12`, and AprilTag
 `DICT_APRILTAG_{16h5,25h9,36h10,36h11}`.

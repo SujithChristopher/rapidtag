@@ -1,0 +1,22 @@
+site_name: RapidTag
+site_description: Fast realtime ArUco, AprilTag, ChArUco, and pose estimation in Rust
+repo_url: https://github.com/SujithChristopher/rapidtag
+docs_dir: docs
+strict: true
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Marker detection: marker-detection.md
+  - Pose estimation: pose-estimation.md
+  - Rigid bodies: rigid-bodies.md
+  - Radxa Dragon Q6A: q6a-deployment.md
+  - Python API: python-api.md
+
+theme:
+  name: mkdocs
+
+markdown_extensions:
+  - tables
+  - toc:
+      permalink: true

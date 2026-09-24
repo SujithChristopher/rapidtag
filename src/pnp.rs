@@ -40,7 +40,7 @@ impl Camera {
     }
 }
 
-/// Distortion coefficients, laid out as OpenCV's k[14]:
+/// Distortion coefficients, laid out as OpenCV's `k[14]`:
 /// [k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4, taux, tauy].
 /// Accepts 0, 4, 5, 8, 12 or 14 coefficients; the thin-prism (s1..s4) terms are
 /// supported, the tilt (taux/tauy) terms are not.
@@ -67,7 +67,7 @@ impl Distortion {
 }
 
 /// Rodrigues, vector -> matrix. Returns the row-major 3x3 R and, optionally, the
-/// 3x9 dR/dr Jacobian laid out as OpenCV's dRdr[27].
+/// 3x9 dR/dr Jacobian laid out as OpenCV's `dRdr[27]`.
 pub fn rodrigues_v2m(r: [f64; 3], want_jac: bool) -> ([f64; 9], Option<[f64; 27]>) {
     let theta = (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt();
     if theta < f64::EPSILON {

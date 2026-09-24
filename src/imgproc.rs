@@ -36,7 +36,7 @@ pub fn to_gray(data: Vec<u8>, h: usize, w: usize, channels: usize) -> GrayImage 
 ///
 /// Rather than emit a 0/255 image that the contour step must then re-scan and
 /// binarize, this writes the foreground mask *directly* into a 1-pixel zero-padded
-/// `i8` label buffer (stride `w+2`, height `h+2`): [`FG`] at foreground pixels, `0`
+/// `i8` label buffer (stride `w+2`, height `h+2`): `FG` at foreground pixels, `0`
 /// everywhere else including the border ring. `for_each_contour` traces that buffer
 /// in place, so we save a whole full-image pass and the separate u8 allocation.
 ///
@@ -299,7 +299,8 @@ pub fn is_convex(pts: &[Pt]) -> bool {
     true
 }
 
-/// Solve for the 3x3 perspective transform mapping src[i] -> dst[i]. Returns row-major H (h8=1).
+/// Solve for the 3x3 perspective transform mapping `src[i]` to `dst[i]`.
+/// Returns row-major H (h8=1).
 ///
 /// The layout mirrors cv::getPerspectiveTransform exactly: the four x-equations
 /// occupy rows 0..4 and the y-equations rows 4..8. That grouping is not cosmetic —

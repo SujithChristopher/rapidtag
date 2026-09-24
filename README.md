@@ -152,6 +152,24 @@ pose = rapidtag.solve_pnp_ransac(
 )
 if pose is not None:
     rvec, tvec, inlier_indices, reprojection_rmse = pose
+
+# --- reusable rigid-body geometry; construct once from your calibration ---
+marker_ids = sorted(int(marker_id) for marker_id in rigid_body_config["markers"])
+body = rapidtag.RigidBody(
+    rigid_body_config["meta"]["tag_size_m"],
+    marker_ids,
+    [rigid_body_config["markers"][str(i)]["rotation_marker_to_reference"]
+     for i in marker_ids],
+    [rigid_body_config["markers"][str(i)]["translation_marker_to_reference_m"]
+     for i in marker_ids],
+)
+body_pose = rapidtag.estimate_rigid_body_pose(
+    corners, ids, body, camera_matrix, dist_coeffs,
+    iterations=100, reprojection_error=3.0,
+)
+if body_pose is not None:
+    print(body_pose.rvec, body_pose.tvec)
+    print(body_pose.used_marker_ids, body_pose.inlier_marker_ids)
 ```
 
 Supported dictionaries: all `DICT_{4,5,6,7}X{4,5,6,7}_{50,100,250,1000}`,
@@ -165,7 +183,8 @@ Implemented:
 - ArUco / AprilTag marker detection (`detectMarkers`, `CORNER_REFINE_NONE`)
 - Generic chessboard detection with sub-pixel corners (`findChessboardCorners`)
 - ChArUco board detection using local marker homographies
-- Iterative PnP, RANSAC PnP, Rodrigues, point projection, and ChArUco board pose estimation
+- Iterative PnP, RANSAC PnP, rigid-body multi-marker pose, Rodrigues, point projection,
+  and ChArUco board pose estimation
 
 Not yet implemented: marker-corner refinement, grid boards, camera calibration,
 `refineDetectedMarkers`, and ChArUco's camera-aware interpolation path.

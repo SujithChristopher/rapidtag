@@ -24,6 +24,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod dictionary;
 mod imgproc;
 mod pnp;
+mod rigid_body;
 
 use detector::DetectorParameters;
 use numpy::PyReadonlyArrayDyn;
@@ -233,6 +234,67 @@ fn detect_markers_batch(
 struct PyCharucoBoard {
     inner: board::CharucoBoard,
     dictionary: String,
+}
+
+/// A collection of square markers with fixed transforms into one reference frame.
+///
+/// Construct this once from a rigid-body calibration and reuse it for every frame.
+#[pyclass(name = "RigidBody")]
+struct PyRigidBody {
+    inner: rigid_body::RigidBody,
+}
+
+#[pymethods]
+impl PyRigidBody {
+    #[new]
+    #[pyo3(signature = (
+        tag_size_m,
+        marker_ids,
+        rotations_marker_to_reference,
+        translations_marker_to_reference
+    ))]
+    fn new(
+        tag_size_m: f64,
+        marker_ids: Vec<i32>,
+        rotations_marker_to_reference: Vec<[[f64; 3]; 3]>,
+        translations_marker_to_reference: Vec<[f64; 3]>,
+    ) -> PyResult<Self> {
+        let inner = rigid_body::RigidBody::new(
+            tag_size_m,
+            marker_ids,
+            rotations_marker_to_reference,
+            translations_marker_to_reference,
+        )
+        .map_err(PyValueError::new_err)?;
+        Ok(Self { inner })
+    }
+
+    #[getter]
+    fn tag_size_m(&self) -> f64 {
+        self.inner.tag_size_m()
+    }
+
+    #[getter]
+    fn marker_ids(&self) -> Vec<i32> {
+        self.inner.marker_ids().to_vec()
+    }
+}
+
+/// Result returned by `estimate_rigid_body_pose`.
+#[pyclass(name = "RigidBodyPose", frozen)]
+struct PyRigidBodyPose {
+    #[pyo3(get)]
+    rvec: Vec<f64>,
+    #[pyo3(get)]
+    tvec: Vec<f64>,
+    #[pyo3(get)]
+    inlier_indices: Vec<usize>,
+    #[pyo3(get)]
+    inlier_marker_ids: Vec<i32>,
+    #[pyo3(get)]
+    used_marker_ids: Vec<i32>,
+    #[pyo3(get)]
+    reprojection_rmse: f64,
 }
 
 #[pymethods]
@@ -497,6 +559,130 @@ fn solve_pnp_ransac(
     }))
 }
 
+/// Estimate a rigid body's pose directly from detected marker corners and ids.
+///
+/// Marker transforms are precomputed by `RigidBody`. Unknown detected ids are
+/// ignored. A single known marker uses iterative PnP; two or more known markers
+/// use RANSAC and reject bad corners. `inlier_indices` index the flattened known
+/// marker corners, while `inlier_marker_ids` contains markers with at least three
+/// inlier corners.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (
+    marker_corners,
+    marker_ids,
+    rigid_body,
+    camera_matrix,
+    dist_coeffs=None,
+    iterations=100,
+    reprojection_error=3.0,
+    confidence=0.99,
+    seed=0
+))]
+fn estimate_rigid_body_pose(
+    py: Python<'_>,
+    marker_corners: Vec<[[f64; 2]; 4]>,
+    marker_ids: Vec<i32>,
+    rigid_body: &PyRigidBody,
+    camera_matrix: Vec<Vec<f64>>,
+    dist_coeffs: Option<Vec<f64>>,
+    iterations: usize,
+    reprojection_error: f64,
+    confidence: f64,
+    seed: u64,
+) -> PyResult<Option<PyRigidBodyPose>> {
+    if iterations == 0 {
+        return Err(PyValueError::new_err("iterations must be greater than zero"));
+    }
+    if !reprojection_error.is_finite() || reprojection_error <= 0.0 {
+        return Err(PyValueError::new_err(
+            "reprojection_error must be finite and greater than zero",
+        ));
+    }
+    if !confidence.is_finite() || confidence <= 0.0 || confidence >= 1.0 {
+        return Err(PyValueError::new_err(
+            "confidence must be finite and between 0 and 1",
+        ));
+    }
+
+    let correspondences = rigid_body
+        .inner
+        .assemble(&marker_corners, &marker_ids)
+        .map_err(PyValueError::new_err)?;
+    if correspondences.object_points.len() < 4 {
+        return Ok(None);
+    }
+    let (cam, dist) = parse_camera(camera_matrix, dist_coeffs)?;
+
+    let solved = py.allow_threads(|| {
+        if correspondences.object_points.len() == 4 {
+            pnp::solve_pnp(
+                &correspondences.object_points,
+                &correspondences.image_points,
+                &cam,
+                &dist,
+                None,
+            )
+            .map(|(rvec, tvec)| {
+                let (projected, _) = pnp::project_points(
+                    &correspondences.object_points,
+                    rvec,
+                    tvec,
+                    &cam,
+                    &dist,
+                    false,
+                );
+                let squared_error = projected
+                    .iter()
+                    .zip(&correspondences.image_points)
+                    .map(|(a, b)| (a.0 - b.0).powi(2) + (a.1 - b.1).powi(2))
+                    .sum::<f64>();
+                (
+                    rvec,
+                    tvec,
+                    (0..4).collect::<Vec<_>>(),
+                    (squared_error / 4.0).sqrt(),
+                )
+            })
+        } else {
+            pnp::solve_pnp_ransac(
+                &correspondences.object_points,
+                &correspondences.image_points,
+                &cam,
+                &dist,
+                iterations,
+                reprojection_error,
+                confidence,
+                seed,
+            )
+            .map(|pose| (pose.rvec, pose.tvec, pose.inliers, pose.reprojection_rmse))
+        }
+    });
+
+    Ok(solved.map(|(rvec, tvec, inlier_indices, reprojection_rmse)| {
+        let mut inlier_counts = std::collections::HashMap::<i32, usize>::new();
+        for &index in &inlier_indices {
+            if let Some(&marker_id) = correspondences.marker_ids_per_corner.get(index) {
+                *inlier_counts.entry(marker_id).or_default() += 1;
+            }
+        }
+        let inlier_marker_ids = correspondences
+            .used_marker_ids
+            .iter()
+            .copied()
+            .filter(|id| inlier_counts.get(id).copied().unwrap_or(0) >= 3)
+            .collect();
+        PyRigidBodyPose {
+            rvec: rvec.to_vec(),
+            tvec: tvec.to_vec(),
+            inlier_indices,
+            inlier_marker_ids,
+            used_marker_ids: correspondences.used_marker_ids,
+            reprojection_rmse,
+        }
+    }))
+}
+
 /// Project 3D object points into the image (cv::projectPoints).
 #[pyfunction]
 #[pyo3(signature = (object_points, rvec, tvec, camera_matrix, dist_coeffs=None))]
@@ -648,6 +834,8 @@ fn rapidtag(m: &Bound<'_, PyModule>) -> PyResult<()> {
     affinity::init_pool();
     m.add_class::<PyDetectorParameters>()?;
     m.add_class::<PyCharucoBoard>()?;
+    m.add_class::<PyRigidBody>()?;
+    m.add_class::<PyRigidBodyPose>()?;
     m.add_function(wrap_pyfunction!(detect_markers, m)?)?;
     m.add_function(wrap_pyfunction!(detect_markers_batch, m)?)?;
     m.add_function(wrap_pyfunction!(detect_charuco_board, m)?)?;
@@ -656,6 +844,7 @@ fn rapidtag(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_corner_sub_pix, m)?)?;
     m.add_function(wrap_pyfunction!(solve_pnp, m)?)?;
     m.add_function(wrap_pyfunction!(solve_pnp_ransac, m)?)?;
+    m.add_function(wrap_pyfunction!(estimate_rigid_body_pose, m)?)?;
     m.add_function(wrap_pyfunction!(project_points, m)?)?;
     m.add_function(wrap_pyfunction!(rodrigues, m)?)?;
     m.add_function(wrap_pyfunction!(estimate_pose_charuco_board, m)?)?;

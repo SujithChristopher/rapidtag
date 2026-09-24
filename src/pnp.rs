@@ -384,7 +384,11 @@ fn find_homography_dlt(src: &[Pt2d], dst: &[Pt2d]) -> Option<[f64; 9]> {
         a[(2 * i + 1, 7)] = v * y;
         a[(2 * i + 1, 8)] = v;
     }
-    let svd = a.svd(false, true);
+    // With exactly four correspondences A is 8x9. nalgebra returns a thin
+    // 8x9 V^T for that shape, which does not contain the one-dimensional
+    // nullspace row. A^T A is always 9x9 and exposes that final singular vector.
+    let ata = a.transpose() * &a;
+    let svd = ata.svd(false, true);
     let vt = svd.v_t?;
     let h: Vec<f64> = (0..9).map(|i| vt[(8, i)]).collect();
 

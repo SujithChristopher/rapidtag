@@ -38,6 +38,8 @@ class Case:
     dataset: str
     camera: str
     frame: int
+    marker_ids: list[int]
+    marker_corners: list[list[list[float]]]
     object_points: list[list[float]]
     image_points: list[list[float]]
     camera_matrix: list[list[float]]
@@ -77,6 +79,17 @@ def rigid_body_points(config: dict) -> dict[int, np.ndarray]:
     return result
 
 
+def make_rigid_body(config: dict):
+    marker_ids = sorted(int(marker_id) for marker_id in config["markers"])
+    markers = config["markers"]
+    return rapidtag.RigidBody(
+        float(config["meta"]["tag_size_m"]),
+        marker_ids,
+        [markers[str(marker_id)]["rotation_marker_to_reference"] for marker_id in marker_ids],
+        [markers[str(marker_id)]["translation_marker_to_reference_m"] for marker_id in marker_ids],
+    )
+
+
 def build_cases(
     dataset_path: Path,
     marker_points: dict[int, np.ndarray],
@@ -100,10 +113,12 @@ def build_cases(
         for frame in frame_indices:
             object_chunks = []
             image_chunks = []
+            visible_marker_ids = []
             for marker_id, corners in detections[int(frame)].items():
                 points = marker_points.get(int(marker_id))
                 if points is None:
                     continue
+                visible_marker_ids.append(int(marker_id))
                 object_chunks.append(points)
                 image_chunks.append(np.asarray(corners, dtype=np.float64))
             if len(object_chunks) < 2:
@@ -114,6 +129,8 @@ def build_cases(
                     dataset=dataset,
                     camera=camera,
                     frame=int(frame),
+                    marker_ids=visible_marker_ids,
+                    marker_corners=[corners.tolist() for corners in image_chunks],
                     object_points=np.concatenate(object_chunks).tolist(),
                     image_points=np.concatenate(image_chunks).tolist(),
                     camera_matrix=camera_matrix,
@@ -139,11 +156,12 @@ def summarize(name: str, latencies_us: list[float], successes: int, total: int,
     )
 
 
-def benchmark_group(cases: list[Case], iterations: int, threshold: float,
+def benchmark_group(cases: list[Case], rigid_body, iterations: int, threshold: float,
                     confidence: float, seed: int) -> None:
     for case in cases[:20]:
-        rapidtag.solve_pnp_ransac(
-            case.object_points, case.image_points, case.camera_matrix, case.distortion,
+        rapidtag.estimate_rigid_body_pose(
+            case.marker_corners, case.marker_ids, rigid_body,
+            case.camera_matrix, case.distortion,
             iterations=iterations, reprojection_error=threshold,
             confidence=confidence, seed=seed + case.frame,
         )
@@ -154,17 +172,17 @@ def benchmark_group(cases: list[Case], iterations: int, threshold: float,
     rt_success = 0
     for case in cases:
         start = time.perf_counter_ns()
-        result = rapidtag.solve_pnp_ransac(
-            case.object_points, case.image_points, case.camera_matrix, case.distortion,
+        result = rapidtag.estimate_rigid_body_pose(
+            case.marker_corners, case.marker_ids, rigid_body,
+            case.camera_matrix, case.distortion,
             iterations=iterations, reprojection_error=threshold,
             confidence=confidence, seed=seed + case.frame,
         )
         rt_times.append((time.perf_counter_ns() - start) / 1000.0)
         if result is not None:
-            _, _, inliers, rmse = result
             rt_success += 1
-            rt_inlier_ratios.append(len(inliers) / len(case.object_points))
-            rt_rmses.append(rmse)
+            rt_inlier_ratios.append(len(result.inlier_indices) / len(case.object_points))
+            rt_rmses.append(result.reprojection_rmse)
 
     cv_times = []
     cv_inlier_ratios = []
@@ -212,6 +230,7 @@ def main() -> int:
 
     rigid_body = load_toml(RIGID_BODY)
     marker_points = rigid_body_points(rigid_body)
+    pose_body = make_rigid_body(rigid_body)
     total_cases = 0
     for dataset in DATASETS:
         cases = build_cases(dataset, marker_points, args.samples, args.camera_calibration)
@@ -222,7 +241,9 @@ def main() -> int:
             f"median={statistics.median(points):.0f} corners "
             f"({statistics.median(points) / 4:.0f} markers)"
         )
-        benchmark_group(cases, args.iterations, args.threshold, args.confidence, args.seed)
+        benchmark_group(
+            cases, pose_body, args.iterations, args.threshold, args.confidence, args.seed
+        )
 
     print(f"\nbenchmarked {total_cases} camera-frames across both recordings")
     return 0

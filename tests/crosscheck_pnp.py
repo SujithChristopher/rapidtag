@@ -89,6 +89,94 @@ def ransac_pose_outliers():
         and rmse < 0.25 and dr < 0.1 and dt < 0.001
 
 
+def rigid_body_pose_end_to_end():
+    """Assemble marker geometry in RapidTag and reject one bad whole marker."""
+    print("\n--- rigid-body multi-marker pose ---")
+    tag_size = 0.05
+    marker_ids = [1, 2, 3]
+    rotations = [
+        np.eye(3),
+        cv2.Rodrigues(np.array([0.0, 0.55, 0.0]))[0],
+        cv2.Rodrigues(np.array([-0.45, 0.0, 0.0]))[0],
+    ]
+    translations = [
+        np.array([-0.055, 0.0, 0.0]),
+        np.array([0.055, 0.0, -0.018]),
+        np.array([0.0, 0.06, -0.025]),
+    ]
+    body = rapidtag.RigidBody(
+        tag_size,
+        marker_ids,
+        [rotation.tolist() for rotation in rotations],
+        [translation.tolist() for translation in translations],
+    )
+
+    half = tag_size / 2
+    local = np.array([
+        [-half, half, 0.0], [half, half, 0.0],
+        [half, -half, 0.0], [-half, -half, 0.0],
+    ])
+    rvec = np.array([0.23, -0.17, 0.08])
+    tvec = np.array([0.015, -0.012, 0.72])
+    local_rng = np.random.default_rng(2026)
+    detected_corners = []
+    for rotation, translation in zip(rotations, translations):
+        object_corners = local @ rotation.T + translation
+        projected, _ = cv2.projectPoints(object_corners, rvec, tvec, K, DISTS["k1k2p1p2k3"])
+        detected_corners.append(
+            projected.reshape(4, 2) + local_rng.normal(0.0, 0.04, (4, 2))
+        )
+
+    single_pose = rapidtag.estimate_rigid_body_pose(
+        [detected_corners[0].tolist()], [1], body,
+        K.tolist(), DISTS["k1k2p1p2k3"].tolist(),
+    )
+    unknown_pose = rapidtag.estimate_rigid_body_pose(
+        [detected_corners[0].tolist()], [999], body,
+        K.tolist(), DISTS["k1k2p1p2k3"].tolist(),
+    )
+
+    # Treat marker 3 as a false detection and add an unknown marker that the body
+    # definition should ignore completely.
+    detected_corners[2] = local_rng.uniform([0, 0], [640, 480], (4, 2))
+    detected_corners.append(local_rng.uniform([0, 0], [640, 480], (4, 2)))
+    pose = rapidtag.estimate_rigid_body_pose(
+        [corners.tolist() for corners in detected_corners],
+        [1, 2, 3, 999],
+        body,
+        K.tolist(),
+        DISTS["k1k2p1p2k3"].tolist(),
+        iterations=500,
+        reprojection_error=2.0,
+        seed=9,
+    )
+    if pose is None:
+        print("  FAIL - no rigid-body consensus pose")
+        return False
+
+    dr = rot_err(rvec, pose.rvec)
+    dt = float(np.abs(tvec - np.asarray(pose.tvec)).max())
+    print(
+        f"  used={pose.used_marker_ids} inlier_markers={pose.inlier_marker_ids} "
+        f"inlier_corners={len(pose.inlier_indices)}/12 rmse={pose.reprojection_rmse:.4f}px "
+        f"rot_err={dr:.4f}deg t_err={dt*1000:.4f}mm"
+    )
+    return (
+        body.marker_ids == marker_ids
+        and abs(body.tag_size_m - tag_size) < 1e-12
+        and single_pose is not None
+        and single_pose.inlier_marker_ids == [1]
+        and len(single_pose.inlier_indices) == 4
+        and unknown_pose is None
+        and pose.used_marker_ids == marker_ids
+        and set(pose.inlier_marker_ids) == {1, 2}
+        and len(pose.inlier_indices) == 8
+        and pose.reprojection_rmse < 0.2
+        and dr < 0.15
+        and dt < 0.001
+    )
+
+
 def charuco_pose_end_to_end():
     """Render a ChArUco board at a known pose, detect it, recover the pose.
 
@@ -228,6 +316,7 @@ def main():
     ok &= worst_rot < 1e-3 and worst_t < 1e-6 and worst_reproj < 1e-4
 
     ok &= ransac_pose_outliers()
+    ok &= rigid_body_pose_end_to_end()
     ok &= charuco_pose_end_to_end()
     print("\nRESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

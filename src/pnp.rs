@@ -642,6 +642,17 @@ pub fn solve_pnp(
     dist: &Distortion,
     guess: Option<([f64; 3], [f64; 3])>,
 ) -> Option<([f64; 3], [f64; 3])> {
+    solve_pnp_with_refinement(obj, img, cam, dist, guess, 20)
+}
+
+fn solve_pnp_with_refinement(
+    obj: &[Pt3d],
+    img: &[Pt2d],
+    cam: &Camera,
+    dist: &Distortion,
+    guess: Option<([f64; 3], [f64; 3])>,
+    refinement_iterations: usize,
+) -> Option<([f64; 3], [f64; 3])> {
     if obj.len() != img.len() || obj.len() < 4 {
         return None;
     }
@@ -681,7 +692,7 @@ pub fn solve_pnp(
         param[3..].copy_from_slice(&t);
     }
 
-    refine(obj, img, &mut param, cam, dist, 20);
+    refine(obj, img, &mut param, cam, dist, refinement_iterations);
     if !param.iter().all(|v| v.is_finite()) {
         return None;
     }
@@ -689,4 +700,381 @@ pub fn solve_pnp(
         [param[0], param[1], param[2]],
         [param[3], param[4], param[5]],
     ))
+}
+
+/// Result of robust pose estimation with [`solve_pnp_ransac`].
+#[derive(Clone, Debug)]
+pub struct RansacPose {
+    pub rvec: [f64; 3],
+    pub tvec: [f64; 3],
+    pub inliers: Vec<usize>,
+    pub reprojection_rmse: f64,
+}
+
+/// Small deterministic PRNG used for RANSAC sampling.
+///
+/// Keeping this local avoids adding a runtime dependency and makes a supplied
+/// seed reproduce exactly the same hypotheses on every platform.
+struct RansacRng {
+    state: u64,
+}
+
+impl RansacRng {
+    fn new(seed: u64) -> Self {
+        // xorshift64* cannot use the all-zero state.
+        Self {
+            state: if seed == 0 {
+                0x9e37_79b9_7f4a_7c15
+            } else {
+                seed
+            },
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    fn sample(&mut self, population: usize, count: usize) -> [usize; 6] {
+        debug_assert!(count <= 6 && count <= population);
+        let mut indices = [0usize; 6];
+        for i in 0..count {
+            loop {
+                let candidate = self.next_u64() as usize % population;
+                if !indices[..i].contains(&candidate) {
+                    indices[i] = candidate;
+                    break;
+                }
+            }
+        }
+        indices
+    }
+}
+
+fn object_points_are_planar(obj: &[Pt3d]) -> bool {
+    if obj.len() < 3 {
+        return false;
+    }
+    let n = obj.len() as f64;
+    let centroid = Vector3::new(
+        obj.iter().map(|p| p.0).sum::<f64>() / n,
+        obj.iter().map(|p| p.1).sum::<f64>() / n,
+        obj.iter().map(|p| p.2).sum::<f64>() / n,
+    );
+    let mut scatter = Matrix3::zeros();
+    for &(x, y, z) in obj {
+        let d = Vector3::new(x, y, z) - centroid;
+        scatter += d * d.transpose();
+    }
+    let singular = scatter.svd(false, false).singular_values;
+    singular[1] > f64::EPSILON && singular[2] / singular[1] < 1e-3
+}
+
+fn classify_inliers(
+    obj: &[Pt3d],
+    img: &[Pt2d],
+    rvec: [f64; 3],
+    tvec: [f64; 3],
+    cam: &Camera,
+    dist: &Distortion,
+    threshold_sq: f64,
+    inliers: &mut Vec<usize>,
+) -> f64 {
+    let (projected, _) = project_points(obj, rvec, tvec, cam, dist, false);
+    inliers.clear();
+    let mut squared_error = 0.0;
+    for (i, (&observed, &predicted)) in img.iter().zip(projected.iter()).enumerate() {
+        let dx = observed.0 - predicted.0;
+        let dy = observed.1 - predicted.1;
+        let err_sq = dx * dx + dy * dy;
+        if err_sq.is_finite() && err_sq <= threshold_sq {
+            inliers.push(i);
+            squared_error += err_sq;
+        }
+    }
+    squared_error
+}
+
+fn points_in_front(obj: &[Pt3d], rvec: [f64; 3], tvec: [f64; 3]) -> bool {
+    let (rot, _) = rodrigues_v2m(rvec, false);
+    obj.iter().all(|&(x, y, z)| {
+        let camera_z = rot[6] * x + rot[7] * y + rot[8] * z + tvec[2];
+        camera_z.is_finite() && camera_z > f64::EPSILON
+    })
+}
+
+/// Robustly estimate pose while rejecting bad 3D-2D correspondences.
+///
+/// This first-stage RANSAC implementation uses the existing iterative PnP
+/// solver for each minimal hypothesis: five points for planar data and six for
+/// general 3D data. Hypotheses are scored in distorted pixel coordinates, the
+/// iteration limit is reduced adaptively as the inlier ratio improves, and the
+/// winning pose is refined over its full consensus set.
+///
+/// This is intended for boards, multiple known markers, or feature matches. A
+/// single four-corner marker has no redundant correspondence to reject and is
+/// therefore deliberately not accepted here.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_pnp_ransac(
+    obj: &[Pt3d],
+    img: &[Pt2d],
+    cam: &Camera,
+    dist: &Distortion,
+    max_iterations: usize,
+    reprojection_error: f64,
+    confidence: f64,
+    seed: u64,
+) -> Option<RansacPose> {
+    if obj.len() != img.len()
+        || max_iterations == 0
+        || !reprojection_error.is_finite()
+        || reprojection_error <= 0.0
+        || !confidence.is_finite()
+        || confidence <= 0.0
+        || confidence >= 1.0
+        || obj
+            .iter()
+            .any(|p| !p.0.is_finite() || !p.1.is_finite() || !p.2.is_finite())
+        || img.iter().any(|p| !p.0.is_finite() || !p.1.is_finite())
+    {
+        return None;
+    }
+
+    let sample_size = if object_points_are_planar(obj) { 5 } else { 6 };
+    if obj.len() < sample_size {
+        return None;
+    }
+
+    let threshold_sq = reprojection_error * reprojection_error;
+    let mut rng = RansacRng::new(seed);
+    let mut iteration_limit = max_iterations;
+    let mut iteration = 0usize;
+    let mut best_pose = None;
+    let mut best_inliers = Vec::new();
+    let mut candidate_inliers = Vec::with_capacity(obj.len());
+    let mut best_error = f64::INFINITY;
+
+    while iteration < iteration_limit {
+        iteration += 1;
+        let sample = rng.sample(obj.len(), sample_size);
+        let mut sample_obj = [(0.0, 0.0, 0.0); 6];
+        let mut sample_img = [(0.0, 0.0); 6];
+        for i in 0..sample_size {
+            sample_obj[i] = obj[sample[i]];
+            sample_img[i] = img[sample[i]];
+        }
+        let sample_obj = &sample_obj[..sample_size];
+        let sample_img = &sample_img[..sample_size];
+
+        // A hypothesis only needs to be accurate enough for consensus scoring;
+        // the winning pose receives the normal full refinement below.
+        let Some((rvec, tvec)) =
+            solve_pnp_with_refinement(sample_obj, sample_img, cam, dist, None, 6)
+        else {
+            continue;
+        };
+        if !points_in_front(sample_obj, rvec, tvec) {
+            continue;
+        }
+
+        let error = classify_inliers(
+            obj,
+            img,
+            rvec,
+            tvec,
+            cam,
+            dist,
+            threshold_sq,
+            &mut candidate_inliers,
+        );
+        if candidate_inliers.len() < sample_size
+            || candidate_inliers.len() < best_inliers.len()
+            || (candidate_inliers.len() == best_inliers.len() && error >= best_error)
+        {
+            continue;
+        }
+
+        best_pose = Some((rvec, tvec));
+        best_error = error;
+        std::mem::swap(&mut best_inliers, &mut candidate_inliers);
+
+        // N = log(1-confidence) / log(1-inlier_ratio^sample_size).
+        // Clamp the probability away from 0 and 1 to keep the logarithms sane.
+        let inlier_ratio = best_inliers.len() as f64 / obj.len() as f64;
+        let all_inlier_sample = inlier_ratio.powi(sample_size as i32);
+        if all_inlier_sample >= 1.0 - f64::EPSILON {
+            iteration_limit = iteration;
+        } else if all_inlier_sample > f64::EPSILON {
+            let needed = ((1.0 - confidence).ln() / (1.0 - all_inlier_sample).ln())
+                .ceil()
+                .max(1.0) as usize;
+            iteration_limit = iteration_limit.min(needed.max(iteration));
+        }
+    }
+
+    let (mut rvec, mut tvec) = best_pose?;
+    let mut consensus = best_inliers;
+
+    // Local optimisation: refit and reclassify twice. The second pass matters
+    // when the first all-inlier fit pulls a few borderline points into consensus.
+    for _ in 0..2 {
+        if consensus.len() < sample_size {
+            break;
+        }
+        let inlier_obj: Vec<Pt3d> = consensus.iter().map(|&i| obj[i]).collect();
+        let inlier_img: Vec<Pt2d> = consensus.iter().map(|&i| img[i]).collect();
+        let Some((new_rvec, new_tvec)) =
+            solve_pnp(&inlier_obj, &inlier_img, cam, dist, Some((rvec, tvec)))
+        else {
+            break;
+        };
+        if !points_in_front(&inlier_obj, new_rvec, new_tvec) {
+            break;
+        }
+        rvec = new_rvec;
+        tvec = new_tvec;
+        let mut new_consensus = Vec::with_capacity(obj.len());
+        classify_inliers(
+            obj,
+            img,
+            rvec,
+            tvec,
+            cam,
+            dist,
+            threshold_sq,
+            &mut new_consensus,
+        );
+        if new_consensus == consensus {
+            break;
+        }
+        consensus = new_consensus;
+    }
+
+    let mut final_inliers = Vec::with_capacity(obj.len());
+    let final_squared_error = classify_inliers(
+        obj,
+        img,
+        rvec,
+        tvec,
+        cam,
+        dist,
+        threshold_sq,
+        &mut final_inliers,
+    );
+    if final_inliers.len() < sample_size {
+        return None;
+    }
+    let reprojection_rmse = (final_squared_error / final_inliers.len() as f64).sqrt();
+
+    Some(RansacPose {
+        rvec,
+        tvec,
+        inliers: final_inliers,
+        reprojection_rmse,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn camera() -> Camera {
+        Camera {
+            fx: 800.0,
+            fy: 810.0,
+            cx: 320.0,
+            cy: 240.0,
+        }
+    }
+
+    fn distort() -> Distortion {
+        Distortion::from_slice(&[-0.15, 0.04, 0.001, -0.0005, 0.01]).unwrap()
+    }
+
+    fn noisy_projection(obj: &[Pt3d], outliers: &[usize]) -> Vec<Pt2d> {
+        let (mut img, _) = project_points(
+            obj,
+            [0.25, -0.12, 0.08],
+            [0.015, -0.02, 0.7],
+            &camera(),
+            &distort(),
+            false,
+        );
+        for (i, p) in img.iter_mut().enumerate() {
+            let noise = ((i * 17 % 7) as f64 - 3.0) * 0.025;
+            p.0 += noise;
+            p.1 -= noise * 0.7;
+        }
+        for (j, &i) in outliers.iter().enumerate() {
+            img[i] = (40.0 + j as f64 * 83.0, 700.0 - j as f64 * 61.0);
+        }
+        img
+    }
+
+    #[test]
+    fn ransac_rejects_non_planar_outliers() {
+        let obj: Vec<Pt3d> = (0..30)
+            .map(|i| {
+                let x = ((i * 37 % 101) as f64 / 100.0 - 0.5) * 0.16;
+                let y = ((i * 53 % 97) as f64 / 96.0 - 0.5) * 0.12;
+                let z = ((i * 29 % 89) as f64 / 88.0 - 0.5) * 0.05;
+                (x, y, z)
+            })
+            .collect();
+        let outliers = [1usize, 6, 11, 17, 22, 28];
+        let img = noisy_projection(&obj, &outliers);
+        let result = solve_pnp_ransac(&obj, &img, &camera(), &distort(), 300, 2.0, 0.99, 7)
+            .expect("robust pose");
+
+        assert_eq!(result.inliers.len(), obj.len() - outliers.len());
+        assert!(outliers.iter().all(|i| !result.inliers.contains(i)));
+        assert!(result.reprojection_rmse < 0.2);
+        assert!((result.tvec[2] - 0.7).abs() < 1e-3);
+    }
+
+    #[test]
+    fn ransac_rejects_planar_outliers_and_is_deterministic() {
+        let obj: Vec<Pt3d> = (0..5)
+            .flat_map(|y| {
+                (0..6).map(move |x| {
+                    (
+                        (x as f64 - 2.5) * 0.025,
+                        (y as f64 - 2.0) * 0.025,
+                        0.0,
+                    )
+                })
+            })
+            .collect();
+        let outliers = [0usize, 7, 14, 21, 29];
+        let img = noisy_projection(&obj, &outliers);
+        let a = solve_pnp_ransac(&obj, &img, &camera(), &distort(), 200, 2.0, 0.99, 123)
+            .expect("first robust pose");
+        let b = solve_pnp_ransac(&obj, &img, &camera(), &distort(), 200, 2.0, 0.99, 123)
+            .expect("repeat robust pose");
+
+        assert_eq!(a.inliers, b.inliers);
+        assert_eq!(a.rvec, b.rvec);
+        assert_eq!(a.tvec, b.tvec);
+        assert_eq!(a.inliers.len(), obj.len() - outliers.len());
+        assert!(outliers.iter().all(|i| !a.inliers.contains(i)));
+        assert!(a.reprojection_rmse < 0.2);
+    }
+
+    #[test]
+    fn ransac_rejects_invalid_parameters_and_four_point_input() {
+        let obj = vec![(0.0, 0.0, 0.0); 4];
+        let img = vec![(0.0, 0.0); 4];
+        assert!(solve_pnp_ransac(&obj, &img, &camera(), &distort(), 100, 2.0, 0.99, 0).is_none());
+
+        let obj = vec![(0.0, 0.0, 0.0); 6];
+        let img = vec![(0.0, 0.0); 6];
+        assert!(solve_pnp_ransac(&obj, &img, &camera(), &distort(), 0, 2.0, 0.99, 0).is_none());
+        assert!(solve_pnp_ransac(&obj, &img, &camera(), &distort(), 10, 0.0, 0.99, 0).is_none());
+        assert!(solve_pnp_ransac(&obj, &img, &camera(), &distort(), 10, 2.0, 1.0, 0).is_none());
+    }
 }

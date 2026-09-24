@@ -1,3 +1,4 @@
 {
-    "python.defaultInterpreterPath": "/home/sujith/projects/fasttag/.venv/bin/python"
+    "python.defaultInterpreterPath": "/home/sujith/projects/rapidtag/.venv/bin/python",
+    "cmake.sourceDirectory": "F:/personal_projects/rapidtag/opencv"
 }

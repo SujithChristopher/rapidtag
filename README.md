@@ -144,6 +144,14 @@ print(rapidtag.predefined_dictionaries())   # list supported dictionary names
 
 # --- generic calibration chessboard (9 columns x 6 rows of interior corners) ---
 found, chessboard_corners = rapidtag.find_chessboard_corners(img, (9, 6))
+
+# --- robust board / multi-marker pose with bad-correspondence rejection ---
+pose = rapidtag.solve_pnp_ransac(
+    object_points, image_points, camera_matrix, dist_coeffs,
+    iterations=100, reprojection_error=3.0, confidence=0.99, seed=0,
+)
+if pose is not None:
+    rvec, tvec, inlier_indices, reprojection_rmse = pose
 ```
 
 Supported dictionaries: all `DICT_{4,5,6,7}X{4,5,6,7}_{50,100,250,1000}`,
@@ -157,7 +165,7 @@ Implemented:
 - ArUco / AprilTag marker detection (`detectMarkers`, `CORNER_REFINE_NONE`)
 - Generic chessboard detection with sub-pixel corners (`findChessboardCorners`)
 - ChArUco board detection using local marker homographies
-- Iterative PnP, Rodrigues, point projection, and ChArUco board pose estimation
+- Iterative PnP, RANSAC PnP, Rodrigues, point projection, and ChArUco board pose estimation
 
 Not yet implemented: marker-corner refinement, grid boards, camera calibration,
 `refineDetectedMarkers`, and ChArUco's camera-aware interpolation path.
@@ -187,6 +195,7 @@ python tests/crosscheck_chessboard.py  # generic chessboard parity vs OpenCV
 python tests/crosscheck_charuco.py     # ChArUco parity vs OpenCV
 python tests/crosscheck_pnp.py         # geometry and end-to-end pose parity
 python tests/bench.py          # benchmark + parity on real camera data
+python scripts/bench_ransac_dome.py    # multi-marker RANSAC benchmark on dome recordings
 ```
 
 The verification figures above are reproduced by the scripts in `scripts/`

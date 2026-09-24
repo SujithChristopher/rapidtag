@@ -54,6 +54,41 @@ def reproj_err(obj, img, rvec, tvec, dist):
     return float(np.abs(p.reshape(-1, 2) - img).max())
 
 
+def ransac_pose_outliers():
+    """Recover a pose with 25% deliberately corrupted correspondences."""
+    print("\n--- solvePnPRansac outlier rejection ---")
+    local_rng = np.random.default_rng(1234)
+    obj = local_rng.uniform(-0.08, 0.08, (40, 3))
+    rvec = np.array([0.25, -0.12, 0.08])
+    tvec = np.array([0.015, -0.02, 0.70])
+    dist = DISTS["k1k2p1p2k3"]
+    img, _ = cv2.projectPoints(obj, rvec.reshape(3, 1), tvec.reshape(3, 1), K, dist)
+    img = img.reshape(-1, 2) + local_rng.normal(0, 0.08, (len(obj), 2))
+    outliers = np.array([1, 5, 9, 13, 17, 21, 25, 29, 33, 37])
+    img[outliers] = local_rng.uniform([0, 0], [640, 480], (len(outliers), 2))
+
+    result = rapidtag.solve_pnp_ransac(
+        obj.tolist(), img.tolist(), K.tolist(), dist.tolist(),
+        iterations=300, reprojection_error=2.0, confidence=0.99, seed=7,
+    )
+    if result is None:
+        print("  FAIL - no consensus pose")
+        return False
+    rt_r, rt_t, inliers, rmse = result
+    repeated = rapidtag.solve_pnp_ransac(
+        obj.tolist(), img.tolist(), K.tolist(), dist.tolist(),
+        iterations=300, reprojection_error=2.0, confidence=0.99, seed=7,
+    )
+    deterministic = repeated == result
+    rejected = set(outliers).isdisjoint(inliers)
+    dr = rot_err(rvec, rt_r)
+    dt = float(np.abs(tvec - np.asarray(rt_t)).max())
+    print(f"  inliers={len(inliers)}/{len(obj)} rmse={rmse:.4f}px "
+          f"rot_err={dr:.4f}deg t_err={dt*1000:.4f}mm deterministic={deterministic}")
+    return rejected and len(inliers) == len(obj) - len(outliers) and deterministic \
+        and rmse < 0.25 and dr < 0.1 and dt < 0.001
+
+
 def charuco_pose_end_to_end():
     """Render a ChArUco board at a known pose, detect it, recover the pose.
 
@@ -192,6 +227,7 @@ def main():
     print(f"Worst reprojection gap      : {worst_reproj:.3e} px")
     ok &= worst_rot < 1e-3 and worst_t < 1e-6 and worst_reproj < 1e-4
 
+    ok &= ransac_pose_outliers()
     ok &= charuco_pose_end_to_end()
     print("\nRESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

@@ -3,8 +3,9 @@
 //!
 //! Ported so far: detectMarkers (CORNER_REFINE_NONE), CharucoDetector::detectBoard
 //! (local-homography path), findChessboardCorners, and solvePnP
-//! (SOLVEPNP_ITERATIVE) with Rodrigues, projectPoints and undistortPoints. Not
-//! yet ported: refineDetectedMarkers, the charuco approxCalib path, and calibration.
+//! (SOLVEPNP_ITERATIVE and a robust RANSAC wrapper) with Rodrigues, projectPoints
+//! and undistortPoints. Not yet ported: refineDetectedMarkers, the charuco
+//! approxCalib path, and calibration.
 
 mod affinity;
 mod board;
@@ -407,6 +408,95 @@ fn solve_pnp(
     Ok(pnp::solve_pnp(&obj, &img, &cam, &dist, guess).map(|(r, t)| (r.to_vec(), t.to_vec())))
 }
 
+/// Robustly estimate pose while rejecting bad 3D-2D correspondences.
+///
+/// Returns `(rvec, tvec, inlier_indices, reprojection_rmse)`, or None when no
+/// consensus pose can be found. This Stage-1 solver samples five points for a
+/// planar object and six for general 3D geometry, then refines the best pose on
+/// all inliers. It therefore requires at least five correspondences and is not
+/// intended for a single four-corner marker.
+#[pyfunction]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+#[pyo3(signature = (
+    object_points,
+    image_points,
+    camera_matrix,
+    dist_coeffs=None,
+    iterations=100,
+    reprojection_error=3.0,
+    confidence=0.99,
+    seed=0
+))]
+fn solve_pnp_ransac(
+    py: Python<'_>,
+    object_points: Vec<[f64; 3]>,
+    image_points: Vec<[f64; 2]>,
+    camera_matrix: Vec<Vec<f64>>,
+    dist_coeffs: Option<Vec<f64>>,
+    iterations: usize,
+    reprojection_error: f64,
+    confidence: f64,
+    seed: u64,
+) -> PyResult<Option<(Vec<f64>, Vec<f64>, Vec<usize>, f64)>> {
+    if object_points.len() != image_points.len() {
+        return Err(PyValueError::new_err(
+            "object_points and image_points must have the same length",
+        ));
+    }
+    if object_points.len() < 5 {
+        return Err(PyValueError::new_err(
+            "solve_pnp_ransac needs at least 5 point correspondences (6 for non-planar geometry)",
+        ));
+    }
+    if iterations == 0 {
+        return Err(PyValueError::new_err("iterations must be greater than zero"));
+    }
+    if !reprojection_error.is_finite() || reprojection_error <= 0.0 {
+        return Err(PyValueError::new_err(
+            "reprojection_error must be finite and greater than zero",
+        ));
+    }
+    if !confidence.is_finite() || confidence <= 0.0 || confidence >= 1.0 {
+        return Err(PyValueError::new_err(
+            "confidence must be finite and between 0 and 1",
+        ));
+    }
+    if object_points
+        .iter()
+        .flatten()
+        .chain(image_points.iter().flatten())
+        .any(|v| !v.is_finite())
+    {
+        return Err(PyValueError::new_err(
+            "object_points and image_points must contain only finite values",
+        ));
+    }
+
+    let (cam, dist) = parse_camera(camera_matrix, dist_coeffs)?;
+    let obj: Vec<pnp::Pt3d> = object_points.iter().map(|p| (p[0], p[1], p[2])).collect();
+    let img: Vec<pnp::Pt2d> = image_points.iter().map(|p| (p[0], p[1])).collect();
+    let result = py.allow_threads(|| {
+        pnp::solve_pnp_ransac(
+            &obj,
+            &img,
+            &cam,
+            &dist,
+            iterations,
+            reprojection_error,
+            confidence,
+            seed,
+        )
+    });
+    Ok(result.map(|pose| {
+        (
+            pose.rvec.to_vec(),
+            pose.tvec.to_vec(),
+            pose.inliers,
+            pose.reprojection_rmse,
+        )
+    }))
+}
+
 /// Project 3D object points into the image (cv::projectPoints).
 #[pyfunction]
 #[pyo3(signature = (object_points, rvec, tvec, camera_matrix, dist_coeffs=None))]
@@ -565,6 +655,7 @@ fn rapidtag(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(predefined_dictionaries, m)?)?;
     m.add_function(wrap_pyfunction!(_corner_sub_pix, m)?)?;
     m.add_function(wrap_pyfunction!(solve_pnp, m)?)?;
+    m.add_function(wrap_pyfunction!(solve_pnp_ransac, m)?)?;
     m.add_function(wrap_pyfunction!(project_points, m)?)?;
     m.add_function(wrap_pyfunction!(rodrigues, m)?)?;
     m.add_function(wrap_pyfunction!(estimate_pose_charuco_board, m)?)?;

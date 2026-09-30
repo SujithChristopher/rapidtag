@@ -20,6 +20,12 @@ def stub_public_names() -> set[str]:
         for node in tree.body
         if isinstance(node, (ast.ClassDef, ast.FunctionDef))
         and not node.name.startswith("_")
+    } | {
+        node.target.id
+        for node in tree.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and not node.target.id.startswith("_")
     }
 
 

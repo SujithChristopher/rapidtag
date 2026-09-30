@@ -194,13 +194,14 @@ Supported dictionaries: all `DICT_{4,5,6,7}X{4,5,6,7}_{50,100,250,1000}`,
 
 Implemented:
 
-- ArUco / AprilTag marker detection (`detectMarkers`, `CORNER_REFINE_NONE`)
+- ArUco / AprilTag marker detection with none, subpixel, contour, and
+  AprilTag 2 quad candidate modes
 - Generic chessboard detection with sub-pixel corners (`findChessboardCorners`)
 - ChArUco board detection using local marker homographies
 - Iterative PnP, RANSAC PnP, rigid-body multi-marker pose, Rodrigues, point projection,
   and ChArUco board pose estimation
 
-Not yet implemented: marker-corner refinement, grid boards, camera calibration,
+Not yet implemented: grid boards, camera calibration,
 `refineDetectedMarkers`, and ChArUco's camera-aware interpolation path.
 
 ## Build from source

@@ -393,6 +393,7 @@ dependencies = [
  "numpy",
  "pyo3",
  "rayon",
+ "rustc-hash",
 ]
 
 [[package]]

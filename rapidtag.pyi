@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 from typing import Optional, TypeAlias
+from typing import Final
 
 import numpy as np
 from numpy.typing import NDArray
@@ -9,6 +10,11 @@ _Point3: TypeAlias = Sequence[float]
 _Matrix3: TypeAlias = Sequence[Sequence[float]]
 _MarkerCorners: TypeAlias = Sequence[_Point2]
 _ImageU8: TypeAlias = NDArray[np.uint8]
+
+CORNER_REFINE_NONE: Final[int] = 0
+CORNER_REFINE_SUBPIX: Final[int] = 1
+CORNER_REFINE_CONTOUR: Final[int] = 2
+CORNER_REFINE_APRILTAG: Final[int] = 3
 
 class DetectorParameters:
     def __init__(self) -> None: ...
@@ -20,6 +26,19 @@ class DetectorParameters:
     error_correction_rate: float
     detect_inverted_marker: bool
     min_side_length_canonical_img: int
+    corner_refinement_method: int
+    corner_refinement_win_size: int
+    relative_corner_refinement_win_size: float
+    corner_refinement_max_iterations: int
+    corner_refinement_min_accuracy: float
+    april_tag_quad_decimate: float
+    april_tag_quad_sigma: float
+    april_tag_min_cluster_pixels: int
+    april_tag_max_nmaxima: int
+    april_tag_critical_rad: float
+    april_tag_max_line_fit_mse: float
+    april_tag_min_white_black_diff: int
+    april_tag_deglitch: bool
 
 class CharucoBoard:
     def __init__(

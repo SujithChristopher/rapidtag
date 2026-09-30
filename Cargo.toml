@@ -16,6 +16,7 @@ nalgebra = "0.33"
 rayon = "1.10"
 mimalloc = { version = "0.1", default-features = false }
 libc = "0.2"
+rustc-hash = "1.1"
 
 [profile.release]
 lto = true

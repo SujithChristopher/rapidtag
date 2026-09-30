@@ -1,5 +1,8 @@
-//! Port of the cv::aruco::ArucoDetector::detectMarkers pipeline (CORNER_REFINE_NONE).
+//! ArUco marker detection with optional corner refinement.
 
+use crate::apriltag;
+use crate::corner_refine;
+use crate::cornersubpix::corner_sub_pix;
 use crate::contours::for_each_contour;
 use crate::dictionary::{Dictionary, DEFAULT_VALID_BIT_ID_THRESHOLD};
 use crate::imgproc::{self, Pt};
@@ -27,11 +30,21 @@ pub struct DetectorParameters {
     pub detect_inverted_marker: bool,
     pub min_side_length_canonical_img: i32,
     pub valid_bit_id_threshold: f32,
-    /// Half-size of the cornerSubPix search window. Used by the ChArUco corner
-    /// refinement; marker corner refinement itself is still CORNER_REFINE_NONE.
+    /// 0: none, 1: subpixel, 2: contour lines, 3: AprilTag-style edge lines.
+    pub corner_refinement_method: i32,
+    /// Half-size of the cornerSubPix search window.
     pub corner_refinement_win_size: i32,
+    pub relative_corner_refinement_win_size: f64,
     pub corner_refinement_max_iterations: i32,
     pub corner_refinement_min_accuracy: f64,
+    pub april_tag_min_cluster_pixels: i32,
+    pub april_tag_quad_decimate: f64,
+    pub april_tag_quad_sigma: f64,
+    pub april_tag_max_nmaxima: i32,
+    pub april_tag_critical_rad: f64,
+    pub april_tag_max_line_fit_mse: f64,
+    pub april_tag_min_white_black_diff: i32,
+    pub april_tag_deglitch: bool,
 }
 
 impl Default for DetectorParameters {
@@ -56,9 +69,19 @@ impl Default for DetectorParameters {
             detect_inverted_marker: false,
             min_side_length_canonical_img: 32,
             valid_bit_id_threshold: DEFAULT_VALID_BIT_ID_THRESHOLD,
+            corner_refinement_method: 0,
             corner_refinement_win_size: 5,
+            relative_corner_refinement_win_size: 0.3,
             corner_refinement_max_iterations: 30,
             corner_refinement_min_accuracy: 0.1,
+            april_tag_min_cluster_pixels: 5,
+            april_tag_quad_decimate: 0.0,
+            april_tag_quad_sigma: 0.0,
+            april_tag_max_nmaxima: 10,
+            april_tag_critical_rad: 10.0 * std::f64::consts::PI / 180.0,
+            april_tag_max_line_fit_mse: 10.0,
+            april_tag_min_white_black_diff: 5,
+            april_tag_deglitch: false,
         }
     }
 }
@@ -106,7 +129,12 @@ fn find_marker_contours(lbl: &mut [i8], iw: i32, ih: i32, p: &DetectorParameters
         if min_dist_sq < min_corner * min_corner {
             return;
         }
-        out.push([approx[0], approx[1], approx[2], approx[3]]);
+        let corners = [approx[0], approx[1], approx[2], approx[3]];
+        out.push(if p.corner_refinement_method == 2 {
+            corner_refine::contour(&corners, contour)
+        } else {
+            corners
+        });
     });
     out
 }
@@ -371,6 +399,33 @@ fn finalize(
             Some((id, rotation)) => {
                 let mut c = cand;
                 c.rotate_left((4 - rotation) % 4); // correctCornerPosition
+                match p.corner_refinement_method {
+                    1 => {
+                        let min_side = (0..4)
+                            .map(|i| {
+                                let a = c[i];
+                                let b = c[(i + 1) % 4];
+                                (a.0 - b.0).hypot(a.1 - b.1)
+                            })
+                            .fold(f32::MAX, f32::min);
+                        let module = min_side
+                            / (dict.marker_size + 2 * p.marker_border_bits as usize) as f32;
+                        let win = ((module as f64 * p.relative_corner_refinement_win_size)
+                            .round() as i32)
+                            .clamp(1, p.corner_refinement_win_size.max(1))
+                            as usize;
+                        for point in &mut c {
+                            *point = corner_sub_pix(
+                                gray,
+                                *point,
+                                win,
+                                p.corner_refinement_max_iterations,
+                                p.corner_refinement_min_accuracy,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
                 detections.push(Detection { corners: c, id: id as i32 });
             }
             None => rejected.push(cand),
@@ -385,6 +440,9 @@ pub fn detect_markers(
     dict: &Dictionary,
     p: &DetectorParameters,
 ) -> (Vec<Detection>, Vec<Quad>) {
+    if p.corner_refinement_method == 3 {
+        return finalize(gray, apriltag::candidates(gray, p), dict, p);
+    }
     let per_scale: Vec<Vec<Quad>> = (0..n_scales(p))
         .into_par_iter()
         .map(|i| candidates_for_scale(gray, p, i))
@@ -403,6 +461,12 @@ pub fn detect_markers_multi(
     dict: &Dictionary,
     p: &DetectorParameters,
 ) -> Vec<(Vec<Detection>, Vec<Quad>)> {
+    if p.corner_refinement_method == 3 {
+        return grays.into_par_iter().map(|gray| {
+            let candidates = apriltag::candidates(&gray, p);
+            finalize(&gray, candidates, dict, p)
+        }).collect();
+    }
     let ns = n_scales(p);
     // Flat work list ordered (frame, scale) with scale innermost, so per-frame
     // results stay in scale order when regrouped.

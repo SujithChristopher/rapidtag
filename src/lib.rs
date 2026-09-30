@@ -1,17 +1,19 @@
 //! RapidTag — fast, pure-Rust fiducial marker detection for realtime use,
 //! exposed to Python via PyO3/maturin.
 //!
-//! Ported so far: detectMarkers (CORNER_REFINE_NONE), CharucoDetector::detectBoard
+//! Ported so far: detectMarkers with optional corner refinement, CharucoDetector::detectBoard
 //! (local-homography path), findChessboardCorners, and solvePnP
 //! (SOLVEPNP_ITERATIVE and a robust RANSAC wrapper) with Rodrigues, projectPoints
 //! and undistortPoints. Not yet ported: refineDetectedMarkers, the charuco
 //! approxCalib path, and calibration.
 
 mod affinity;
+mod apriltag;
 mod board;
 mod charuco;
 mod chessboard;
 mod contours;
+mod corner_refine;
 mod cornersubpix;
 mod detector;
 #[allow(non_upper_case_globals)]
@@ -31,8 +33,9 @@ use numpy::PyReadonlyArrayDyn;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-/// Detector parameters (subset relevant to marker detection). Fields mirror
-/// cv::aruco::DetectorParameters and default to the same values.
+/// Detector parameters for marker detection. `corner_refinement_method` accepts
+/// `CORNER_REFINE_NONE`, `CORNER_REFINE_SUBPIX`, `CORNER_REFINE_CONTOUR`, or
+/// `CORNER_REFINE_APRILTAG`. The latter uses the AprilTag 2 quad candidate path.
 #[pyclass(name = "DetectorParameters")]
 #[derive(Clone)]
 struct PyDetectorParameters {
@@ -112,6 +115,144 @@ impl PyDetectorParameters {
     fn set_min_side_length_canonical_img(&mut self, v: i32) {
         self.inner.min_side_length_canonical_img = v;
     }
+
+    #[getter]
+    fn corner_refinement_method(&self) -> i32 {
+        self.inner.corner_refinement_method
+    }
+    #[setter]
+    fn set_corner_refinement_method(&mut self, v: i32) -> PyResult<()> {
+        if !(0..=3).contains(&v) {
+            return Err(PyValueError::new_err("corner_refinement_method must be 0, 1, 2, or 3"));
+        }
+        self.inner.corner_refinement_method = v;
+        Ok(())
+    }
+    #[getter]
+    fn corner_refinement_win_size(&self) -> i32 {
+        self.inner.corner_refinement_win_size
+    }
+    #[setter]
+    fn set_corner_refinement_win_size(&mut self, v: i32) -> PyResult<()> {
+        if v < 1 {
+            return Err(PyValueError::new_err("corner_refinement_win_size must be positive"));
+        }
+        self.inner.corner_refinement_win_size = v;
+        Ok(())
+    }
+    #[getter]
+    fn relative_corner_refinement_win_size(&self) -> f64 {
+        self.inner.relative_corner_refinement_win_size
+    }
+    #[setter]
+    fn set_relative_corner_refinement_win_size(&mut self, v: f64) -> PyResult<()> {
+        if !v.is_finite() || v <= 0.0 {
+            return Err(PyValueError::new_err(
+                "relative_corner_refinement_win_size must be positive and finite",
+            ));
+        }
+        self.inner.relative_corner_refinement_win_size = v;
+        Ok(())
+    }
+    #[getter]
+    fn corner_refinement_max_iterations(&self) -> i32 {
+        self.inner.corner_refinement_max_iterations
+    }
+    #[setter]
+    fn set_corner_refinement_max_iterations(&mut self, v: i32) -> PyResult<()> {
+        if v < 1 {
+            return Err(PyValueError::new_err(
+                "corner_refinement_max_iterations must be positive",
+            ));
+        }
+        self.inner.corner_refinement_max_iterations = v;
+        Ok(())
+    }
+    #[getter]
+    fn corner_refinement_min_accuracy(&self) -> f64 {
+        self.inner.corner_refinement_min_accuracy
+    }
+    #[setter]
+    fn set_corner_refinement_min_accuracy(&mut self, v: f64) -> PyResult<()> {
+        if !v.is_finite() || v < 0.0 {
+            return Err(PyValueError::new_err(
+                "corner_refinement_min_accuracy must be nonnegative and finite",
+            ));
+        }
+        self.inner.corner_refinement_min_accuracy = v;
+        Ok(())
+    }
+
+    #[getter]
+    fn april_tag_quad_decimate(&self) -> f64 { self.inner.april_tag_quad_decimate }
+    #[setter]
+    fn set_april_tag_quad_decimate(&mut self, v: f64) -> PyResult<()> {
+        if !v.is_finite() || v < 0.0 {
+            return Err(PyValueError::new_err("april_tag_quad_decimate must be nonnegative and finite"));
+        }
+        self.inner.april_tag_quad_decimate = v;
+        Ok(())
+    }
+    #[getter]
+    fn april_tag_quad_sigma(&self) -> f64 { self.inner.april_tag_quad_sigma }
+    #[setter]
+    fn set_april_tag_quad_sigma(&mut self, v: f64) -> PyResult<()> {
+        if !v.is_finite() {
+            return Err(PyValueError::new_err("april_tag_quad_sigma must be finite"));
+        }
+        self.inner.april_tag_quad_sigma = v;
+        Ok(())
+    }
+    #[getter]
+    fn april_tag_min_cluster_pixels(&self) -> i32 { self.inner.april_tag_min_cluster_pixels }
+    #[setter]
+    fn set_april_tag_min_cluster_pixels(&mut self, v: i32) -> PyResult<()> {
+        if v < 1 { return Err(PyValueError::new_err("april_tag_min_cluster_pixels must be positive")); }
+        self.inner.april_tag_min_cluster_pixels = v;
+        Ok(())
+    }
+    #[getter]
+    fn april_tag_max_nmaxima(&self) -> i32 { self.inner.april_tag_max_nmaxima }
+    #[setter]
+    fn set_april_tag_max_nmaxima(&mut self, v: i32) -> PyResult<()> {
+        if v < 4 { return Err(PyValueError::new_err("april_tag_max_nmaxima must be at least four")); }
+        self.inner.april_tag_max_nmaxima = v;
+        Ok(())
+    }
+    #[getter]
+    fn april_tag_critical_rad(&self) -> f64 { self.inner.april_tag_critical_rad }
+    #[setter]
+    fn set_april_tag_critical_rad(&mut self, v: f64) -> PyResult<()> {
+        if !v.is_finite() || v <= 0.0 || v >= std::f64::consts::FRAC_PI_2 {
+            return Err(PyValueError::new_err("april_tag_critical_rad must be between 0 and pi/2"));
+        }
+        self.inner.april_tag_critical_rad = v;
+        Ok(())
+    }
+    #[getter]
+    fn april_tag_max_line_fit_mse(&self) -> f64 { self.inner.april_tag_max_line_fit_mse }
+    #[setter]
+    fn set_april_tag_max_line_fit_mse(&mut self, v: f64) -> PyResult<()> {
+        if !v.is_finite() || v <= 0.0 {
+            return Err(PyValueError::new_err("april_tag_max_line_fit_mse must be positive and finite"));
+        }
+        self.inner.april_tag_max_line_fit_mse = v;
+        Ok(())
+    }
+    #[getter]
+    fn april_tag_min_white_black_diff(&self) -> i32 { self.inner.april_tag_min_white_black_diff }
+    #[setter]
+    fn set_april_tag_min_white_black_diff(&mut self, v: i32) -> PyResult<()> {
+        if !(0..=255).contains(&v) {
+            return Err(PyValueError::new_err("april_tag_min_white_black_diff must be in 0..=255"));
+        }
+        self.inner.april_tag_min_white_black_diff = v;
+        Ok(())
+    }
+    #[getter]
+    fn april_tag_deglitch(&self) -> bool { self.inner.april_tag_deglitch }
+    #[setter]
+    fn set_april_tag_deglitch(&mut self, v: bool) { self.inner.april_tag_deglitch = v; }
 }
 
 /// List the names of the predefined dictionaries this build supports.
@@ -176,11 +317,12 @@ fn to_result(detections: Vec<detector::Detection>) -> MarkerResult {
     (corners, ids)
 }
 
-/// Detect ArUco markers in `image` (HxW grayscale or HxWx3 BGR, uint8).
+/// Detect ArUco or AprilTag markers in `image` (HxW grayscale or HxWx3 BGR, uint8).
 ///
 /// Returns `(corners, ids)`:
 ///   - `corners`: list of markers, each a 4x2 list of (x, y) float corners
 ///   - `ids`: list of integer marker ids, aligned with `corners`
+/// Pass `DetectorParameters` to select a corner refinement method.
 #[pyfunction]
 #[pyo3(signature = (image, dictionary, parameters=None))]
 fn detect_markers(
@@ -832,6 +974,10 @@ fn rapidtag(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // On big.LITTLE ARM, pin the detect worker pool to the fast cores before
     // rayon spins up — see affinity.rs (RAPIDTAG_CORES overrides/disables).
     affinity::init_pool();
+    m.add("CORNER_REFINE_NONE", 0)?;
+    m.add("CORNER_REFINE_SUBPIX", 1)?;
+    m.add("CORNER_REFINE_CONTOUR", 2)?;
+    m.add("CORNER_REFINE_APRILTAG", 3)?;
     m.add_class::<PyDetectorParameters>()?;
     m.add_class::<PyCharucoBoard>()?;
     m.add_class::<PyRigidBody>()?;

@@ -442,72 +442,70 @@ pub fn detect_markers(
     dict: &Dictionary,
     p: &DetectorParameters,
 ) -> (Vec<Detection>, Vec<Quad>) {
-    if p.corner_refinement_method == 3 {
-        return detect_markers_apriltag(gray, dict, p);
-    }
-    let per_scale: Vec<Vec<Quad>> = (0..n_scales(p))
-        .into_par_iter()
-        .map(|i| candidates_for_scale(gray, p, i))
-        .collect();
-    let candidates: Vec<Quad> = per_scale.into_iter().flatten().collect();
-    finalize(gray, candidates, dict, p)
-}
-
-/// Search the full frame at the requested scale, then optionally re-run the
-/// AprilTag quad detector on full-resolution crops around decoded markers.
-fn detect_markers_apriltag(
-    gray: &GrayImage,
-    dict: &Dictionary,
-    p: &DetectorParameters,
-) -> (Vec<Detection>, Vec<Quad>) {
-    let (mut detections, rejected) = finalize(gray, apriltag::candidates(gray, p), dict, p);
-    if !p.april_tag_refine_full_resolution || p.april_tag_quad_decimate <= 1.0 {
-        return (detections, rejected);
-    }
-
-    let mut full_params = p.clone();
-    full_params.april_tag_quad_decimate = 0.0;
-    full_params.april_tag_refine_full_resolution = false;
-    for detection in &mut detections {
-        let (min_x, max_x) = detection.corners.iter().fold((f32::MAX, f32::MIN), |bounds, pt| {
-            (bounds.0.min(pt.0), bounds.1.max(pt.0))
-        });
-        let (min_y, max_y) = detection.corners.iter().fold((f32::MAX, f32::MIN), |bounds, pt| {
-            (bounds.0.min(pt.1), bounds.1.max(pt.1))
-        });
-        if ![min_x, max_x, min_y, max_y].iter().all(|v| v.is_finite()) {
-            continue;
-        }
-        let margin = (0.5 * (max_x - min_x).max(max_y - min_y)).max(16.0);
-        // Keep the crop origin on AprilTag's 4x4 threshold tile grid.
-        let x0 = (((min_x - margin) / 4.0).floor() as i64 * 4)
-            .clamp(0, gray.width() as i64) as u32;
-        let y0 = (((min_y - margin) / 4.0).floor() as i64 * 4)
-            .clamp(0, gray.height() as i64) as u32;
-        let x1 = (((max_x + margin) / 4.0).ceil() as i64 * 4)
-            .clamp(0, gray.width() as i64) as u32;
-        let y1 = (((max_y + margin) / 4.0).ceil() as i64 * 4)
-            .clamp(0, gray.height() as i64) as u32;
-        if x1 <= x0 || y1 <= y0 {
-            continue;
-        }
-        let crop = image::imageops::crop_imm(gray, x0, y0, x1 - x0, y1 - y0).to_image();
-        let (local, _) = finalize(&crop, apriltag::candidates(&crop, &full_params), dict, &full_params);
-        let refined = local.into_iter()
-            .filter(|candidate| candidate.id == detection.id)
-            .map(|candidate| {
-                let corners = candidate.corners.map(|pt| (pt.0 + x0 as f32, pt.1 + y0 as f32));
-                let distance = corners.iter().zip(detection.corners.iter())
-                    .map(|(a, b)| (a.0 - b.0).powi(2) + (a.1 - b.1).powi(2))
-                    .sum::<f32>();
-                (distance, corners)
-            })
-            .min_by(|a, b| a.0.total_cmp(&b.0));
-        if let Some((_, corners)) = refined {
-            detection.corners = corners;
-        }
+    let (mut detections, rejected) = if p.corner_refinement_method == 3 {
+        finalize(gray, apriltag::candidates(gray, p), dict, p)
+    } else {
+        let per_scale: Vec<Vec<Quad>> = (0..n_scales(p))
+            .into_par_iter()
+            .map(|i| candidates_for_scale(gray, p, i))
+            .collect();
+        let candidates: Vec<Quad> = per_scale.into_iter().flatten().collect();
+        finalize(gray, candidates, dict, p)
+    };
+    if wants_full_res_refine(p) {
+        let full_params = full_res_params(p);
+        detections.par_iter_mut().for_each(|d| refine_full_resolution(gray, d, &full_params));
     }
     (detections, rejected)
+}
+
+/// The crop refit runs after a decimated AprilTag search, or after any ArUco-pipeline
+/// method (0-2), where it replaces the coarse corners with AprilTag quad-fit corners.
+fn wants_full_res_refine(p: &DetectorParameters) -> bool {
+    p.april_tag_refine_full_resolution
+        && (p.corner_refinement_method != 3 || p.april_tag_quad_decimate > 1.0)
+}
+
+fn full_res_params(p: &DetectorParameters) -> DetectorParameters {
+    let mut full_params = p.clone();
+    full_params.corner_refinement_method = 3;
+    full_params.april_tag_quad_decimate = 0.0;
+    full_params.april_tag_refine_full_resolution = false;
+    full_params
+}
+
+/// Refit one decoded marker's outer border with the AprilTag quad fitter on a
+/// full-resolution crop, keeping the coarse corners if the fit fails.
+fn refine_full_resolution(gray: &GrayImage, detection: &mut Detection, full_params: &DetectorParameters) {
+    let (min_x, max_x) = detection.corners.iter().fold((f32::MAX, f32::MIN), |bounds, pt| {
+        (bounds.0.min(pt.0), bounds.1.max(pt.0))
+    });
+    let (min_y, max_y) = detection.corners.iter().fold((f32::MAX, f32::MIN), |bounds, pt| {
+        (bounds.0.min(pt.1), bounds.1.max(pt.1))
+    });
+    if ![min_x, max_x, min_y, max_y].iter().all(|v| v.is_finite()) {
+        return;
+    }
+    // The refit only looks at a band around the border; AprilTag's threshold needs
+    // one 3x3 group of 4-pixel tiles (12 px) of context beyond it.
+    let margin = apriltag::border_band(&detection.corners).0 + 12.0;
+    // Keep the crop origin on AprilTag's 4x4 threshold tile grid.
+    let x0 = (((min_x - margin) / 4.0).floor() as i64 * 4)
+        .clamp(0, gray.width() as i64) as u32;
+    let y0 = (((min_y - margin) / 4.0).floor() as i64 * 4)
+        .clamp(0, gray.height() as i64) as u32;
+    let x1 = (((max_x + margin) / 4.0).ceil() as i64 * 4)
+        .clamp(0, gray.width() as i64) as u32;
+    let y1 = (((max_y + margin) / 4.0).ceil() as i64 * 4)
+        .clamp(0, gray.height() as i64) as u32;
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let crop = image::imageops::crop_imm(gray, x0, y0, x1 - x0, y1 - y0).to_image();
+    let local = detection.corners.map(|pt| (pt.0 - x0 as f32, pt.1 - y0 as f32));
+    if let Some(corners) = apriltag::refit_quad(&crop, &local, full_params) {
+        detection.corners = corners.map(|pt| (pt.0 + x0 as f32, pt.1 + y0 as f32));
+    }
 }
 
 /// Detect markers across many frames using flat (frame × scale) parallelism.
@@ -520,11 +518,31 @@ pub fn detect_markers_multi(
     dict: &Dictionary,
     p: &DetectorParameters,
 ) -> Vec<(Vec<Detection>, Vec<Quad>)> {
-    if p.corner_refinement_method == 3 {
-        return grays.into_par_iter()
-            .map(|gray| detect_markers_apriltag(&gray, dict, p))
-            .collect();
+    let mut results: Vec<(Vec<Detection>, Vec<Quad>)> = if p.corner_refinement_method == 3 {
+        grays.par_iter()
+            .map(|gray| finalize(gray, apriltag::candidates(gray, p), dict, p))
+            .collect()
+    } else {
+        aruco_multi(&grays, dict, p)
+    };
+    if wants_full_res_refine(p) {
+        // One flat (frame, marker) work list, so a pair of frames with a handful of
+        // tags each spreads across every fast core instead of one core per frame.
+        let full_params = full_res_params(p);
+        results
+            .par_iter_mut()
+            .zip(grays.par_iter())
+            .flat_map(|((dets, _), gray)| dets.par_iter_mut().map(move |d| (d, gray)))
+            .for_each(|(d, gray)| refine_full_resolution(gray, d, &full_params));
     }
+    results
+}
+
+fn aruco_multi(
+    grays: &[GrayImage],
+    dict: &Dictionary,
+    p: &DetectorParameters,
+) -> Vec<(Vec<Detection>, Vec<Quad>)> {
     let ns = n_scales(p);
     // Flat work list ordered (frame, scale) with scale innermost, so per-frame
     // results stay in scale order when regrouped.
@@ -545,7 +563,7 @@ pub fn detect_markers_multi(
     // Finalize each frame in parallel.
     per_frame
         .into_par_iter()
-        .zip(grays.into_par_iter())
-        .map(|(cands, gray)| finalize(&gray, cands, dict, p))
+        .zip(grays.par_iter())
+        .map(|(cands, gray)| finalize(gray, cands, dict, p))
         .collect()
 }

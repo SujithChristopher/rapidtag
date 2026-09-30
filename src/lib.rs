@@ -193,8 +193,9 @@ impl PyDetectorParameters {
         self.inner.april_tag_quad_decimate = v;
         Ok(())
     }
-    /// Refit decoded AprilTag quads in full-resolution crops when decimation exceeds 1.
-    /// A tag missed by the coarse search cannot be recovered by this pass.
+    /// Refit each decoded marker's border with the AprilTag quad fitter in a
+    /// full-resolution crop: after a decimated AprilTag search, or after any ArUco
+    /// pipeline method (0-2). A tag missed by the coarse search cannot be recovered.
     #[getter]
     fn april_tag_refine_full_resolution(&self) -> bool { self.inner.april_tag_refine_full_resolution }
     #[setter]

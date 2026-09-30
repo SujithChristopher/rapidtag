@@ -512,3 +512,107 @@ pub fn candidates(gray: &GrayImage, p: &DetectorParameters) -> Vec<Quad> {
     }
     quads
 }
+
+/// Refit one known marker: fit only the edge cluster that traces the outer border
+/// of `coarse` (in `gray` coordinates) instead of every cluster in the image, and
+/// skip decoding. Returns the fitted corners in `coarse`'s order.
+pub fn refit_quad(gray: &GrayImage, coarse: &Quad, p: &DetectorParameters) -> Option<Quad> {
+    let mut binary = threshold(gray, p);
+    mask_outside_border_band(&mut binary, gray.width() as usize, coarse);
+    let clusters = boundary_clusters(
+        &binary,
+        gray.width() as usize,
+        gray.height() as usize,
+        24usize.max(p.april_tag_min_cluster_pixels as usize),
+    );
+    let side = (0..4)
+        .map(|i| {
+            let (a, b) = (coarse[i], coarse[(i + 1) % 4]);
+            (a.0 - b.0).hypot(a.1 - b.1)
+        })
+        .fold(f32::MAX, f32::min);
+    // Inner bit edges sit one module (side / 8 for a 6x6 code) inside the border.
+    let tol = (0.06 * side).max(2.0);
+    let near_border = |q: &EdgePoint| {
+        let (x, y) = (q.x2 as f32 * 0.5 + 0.5, q.y2 as f32 * 0.5 + 0.5);
+        (0..4).any(|i| segment_distance((x, y), coarse[i], coarse[(i + 1) % 4]) < tol)
+    };
+    let (near, border) = clusters
+        .into_iter()
+        .map(|points| (points.iter().filter(|q| near_border(q)).count(), points))
+        .max_by_key(|(near, _)| *near)?;
+    if near < 24 {
+        return None;
+    }
+    let quad = fit_quad(border, gray, p)?;
+    // Match the fitted corners to the coarse ordering (the fit's start is arbitrary).
+    let cost = |r: usize| {
+        (0..4)
+            .map(|i| {
+                let (f, c) = (quad[(i + r) % 4], coarse[i]);
+                (f.0 - c.0).powi(2) + (f.1 - c.1).powi(2)
+            })
+            .sum::<f32>()
+    };
+    let rotation = (0..4).min_by(|&a, &b| cost(a).total_cmp(&cost(b)))?;
+    Some(std::array::from_fn(|i| quad[(i + rotation) % 4]))
+}
+
+/// Width of the band kept around a coarse border, in pixels outside and inside.
+/// A 6x6-bit tag spans 8 modules between its outer corners: the band keeps one
+/// module of quiet zone, the black border module and half the first data row,
+/// plus slack for the coarse corners' error.
+pub fn border_band(coarse: &Quad) -> (f32, f32) {
+    let side = (0..4)
+        .map(|i| {
+            let (a, b) = (coarse[i], coarse[(i + 1) % 4]);
+            (a.0 - b.0).hypot(a.1 - b.1)
+        })
+        .fold(0.0, f32::max);
+    let module = side / 8.0;
+    (module + 4.0, 1.5 * module + 4.0)
+}
+
+/// Mark pixels away from the coarse border as "no contrast" (127) so the
+/// clustering skips the tag interior and the background.
+fn mask_outside_border_band(binary: &mut [u8], w: usize, coarse: &Quad) {
+    let (outer, inner) = border_band(coarse);
+    let area2: f32 = (0..4)
+        .map(|i| {
+            let (a, b) = (coarse[i], coarse[(i + 1) % 4]);
+            a.0 * b.1 - a.1 * b.0
+        })
+        .sum();
+    let orient = if area2 >= 0.0 { 1.0 } else { -1.0 };
+    // Signed distance to each edge line, positive inside the (convex) quad.
+    let lines: [(f32, f32, f32); 4] = std::array::from_fn(|i| {
+        let (a, b) = (coarse[i], coarse[(i + 1) % 4]);
+        let len = (b.0 - a.0).hypot(b.1 - a.1).max(1e-6);
+        let (nx, ny) = (-(b.1 - a.1) * orient / len, (b.0 - a.0) * orient / len);
+        (nx, ny, -(nx * a.0 + ny * a.1))
+    });
+    for (y, row) in binary.chunks_exact_mut(w).enumerate() {
+        let py = y as f32 + 0.5;
+        for (x, v) in row.iter_mut().enumerate() {
+            let px = x as f32 + 0.5;
+            let d = lines
+                .iter()
+                .map(|&(nx, ny, c)| nx * px + ny * py + c)
+                .fold(f32::MAX, f32::min);
+            if d < -outer || d > inner {
+                *v = 127;
+            }
+        }
+    }
+}
+
+fn segment_distance(p: Pt, a: Pt, b: Pt) -> f32 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 > 0.0 {
+        (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (p.0 - a.0 - t * dx).hypot(p.1 - a.1 - t * dy)
+}

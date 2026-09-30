@@ -55,12 +55,20 @@ The module exports `CORNER_REFINE_NONE`, `CORNER_REFINE_SUBPIX`,
 Invalid methods and invalid corner refinement settings raise `ValueError`.
 `CORNER_REFINE_APRILTAG` selects AprilTag 2 quad candidate detection; see the
 [marker detection guide](marker-detection.md#detector-parameters).
-With `april_tag_quad_decimate > 1`, setting
-`april_tag_refine_full_resolution = True` searches full-resolution crops around
-decoded markers and replaces their corners when the same marker is found locally.
-The option has no effect without decimation and cannot recover a marker missed
-by the coarse full-frame search. If local refinement fails, the coarse corners
-are returned.
+`april_tag_refine_full_resolution = True` refits each decoded marker's outer
+border with the AprilTag quad fitter on a full-resolution crop around it, and
+replaces its corners with the fitted ones. The crops run in parallel across
+all markers in all frames of a batch. It applies in two cases:
+
+- with `CORNER_REFINE_APRILTAG` and `april_tag_quad_decimate > 1`, it restores
+  full-resolution corners after the decimated search (no effect without
+  decimation);
+- with any other `corner_refinement_method`, the fast ArUco pipeline finds and
+  decodes the markers, and the crops give them AprilTag quad-fit corners. This
+  is the fastest way to get AprilTag-quality corners.
+
+The refit cannot recover a marker missed by the coarse full-frame search. If
+the refit fails, the coarse corners are returned.
 
 ## ChArUco and chessboards
 

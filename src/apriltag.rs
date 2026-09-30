@@ -515,24 +515,25 @@ pub fn candidates(gray: &GrayImage, p: &DetectorParameters) -> Vec<Quad> {
 
 /// Refit one known marker: fit only the edge cluster that traces the outer border
 /// of `coarse` (in `gray` coordinates) instead of every cluster in the image, and
-/// skip decoding. Returns the fitted corners in `coarse`'s order.
-pub fn refit_quad(gray: &GrayImage, coarse: &Quad, p: &DetectorParameters) -> Option<Quad> {
+/// skip decoding. `modules` is the marker width in modules (data bits plus both
+/// borders). Returns the fitted corners in `coarse`'s order.
+pub fn refit_quad(
+    gray: &GrayImage,
+    coarse: &Quad,
+    p: &DetectorParameters,
+    modules: usize,
+) -> Option<Quad> {
+    let (outer, inner) = border_band(coarse, modules, p.marker_border_bits);
     let mut binary = threshold(gray, p);
-    mask_outside_border_band(&mut binary, gray.width() as usize, coarse);
+    mask_outside_border_band(&mut binary, gray.width() as usize, coarse, outer, inner);
     let clusters = boundary_clusters(
         &binary,
         gray.width() as usize,
         gray.height() as usize,
         24usize.max(p.april_tag_min_cluster_pixels as usize),
     );
-    let side = (0..4)
-        .map(|i| {
-            let (a, b) = (coarse[i], coarse[(i + 1) % 4]);
-            (a.0 - b.0).hypot(a.1 - b.1)
-        })
-        .fold(f32::MAX, f32::min);
-    // Inner bit edges sit one module (side / 8 for a 6x6 code) inside the border.
-    let tol = (0.06 * side).max(2.0);
+    // Inner bit edges sit at least one module inside the outer border.
+    let tol = (0.5 * module_size(coarse, modules)).max(2.0);
     let near_border = |q: &EdgePoint| {
         let (x, y) = (q.x2 as f32 * 0.5 + 0.5, q.y2 as f32 * 0.5 + 0.5);
         (0..4).any(|i| segment_distance((x, y), coarse[i], coarse[(i + 1) % 4]) < tol)
@@ -558,25 +559,28 @@ pub fn refit_quad(gray: &GrayImage, coarse: &Quad, p: &DetectorParameters) -> Op
     Some(std::array::from_fn(|i| quad[(i + rotation) % 4]))
 }
 
-/// Width of the band kept around a coarse border, in pixels outside and inside.
-/// A 6x6-bit tag spans 8 modules between its outer corners: the band keeps one
-/// module of quiet zone, the black border module and half the first data row,
-/// plus slack for the coarse corners' error.
-pub fn border_band(coarse: &Quad) -> (f32, f32) {
+/// Longest side of `coarse` divided by the marker width in modules.
+fn module_size(coarse: &Quad, modules: usize) -> f32 {
     let side = (0..4)
         .map(|i| {
             let (a, b) = (coarse[i], coarse[(i + 1) % 4]);
             (a.0 - b.0).hypot(a.1 - b.1)
         })
         .fold(0.0, f32::max);
-    let module = side / 8.0;
-    (module + 4.0, 1.5 * module + 4.0)
+    side / modules.max(1) as f32
+}
+
+/// Width of the band kept around a coarse border, in pixels outside and inside:
+/// one module of quiet zone, the black border and half the first data row, plus
+/// slack for the coarse corners' error.
+pub fn border_band(coarse: &Quad, modules: usize, border_bits: i32) -> (f32, f32) {
+    let module = module_size(coarse, modules);
+    (module + 4.0, (border_bits.max(1) as f32 + 0.5) * module + 4.0)
 }
 
 /// Mark pixels away from the coarse border as "no contrast" (127) so the
 /// clustering skips the tag interior and the background.
-fn mask_outside_border_band(binary: &mut [u8], w: usize, coarse: &Quad) {
-    let (outer, inner) = border_band(coarse);
+fn mask_outside_border_band(binary: &mut [u8], w: usize, coarse: &Quad, outer: f32, inner: f32) {
     let area2: f32 = (0..4)
         .map(|i| {
             let (a, b) = (coarse[i], coarse[(i + 1) % 4]);

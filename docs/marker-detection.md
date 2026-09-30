@@ -61,7 +61,25 @@ AprilTag-specific controls are `april_tag_quad_decimate` (default `0`, disabled)
 `april_tag_max_line_fit_mse` (`10`), `april_tag_min_white_black_diff` (`5`),
 and `april_tag_deglitch` (`False`). They affect the AprilTag candidate path only.
 
-For a faster search with full-resolution corner fitting on the markers found:
+For AprilTag-quality corners at close to ArUco speed, keep the default ArUco
+search and refit each found marker with the AprilTag quad fitter:
+
+```python
+parameters = rapidtag.DetectorParameters()
+parameters.april_tag_refine_full_resolution = True
+corners, ids = rapidtag.detect_markers(image, "DICT_APRILTAG_36h11", parameters)
+```
+
+Each decoded marker gets a full-resolution crop; only the edge cluster tracing
+its outer border is fitted, so the refit skips the tag interior and does not
+decode again. Crops from every marker in every frame of a
+`detect_markers_batch` call run in parallel. The corners match a full-resolution
+`CORNER_REFINE_APRILTAG` search, at a fraction of its cost. On 1280×800 frames
+with six 36h11 tags on a QCS6490 this runs at about 70 fps, against about 10 fps
+for the full AprilTag search. Markers the ArUco search misses are not recovered.
+
+For a decimated AprilTag search with full-resolution corner fitting on the
+markers found:
 
 ```python
 parameters = rapidtag.DetectorParameters()

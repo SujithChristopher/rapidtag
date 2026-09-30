@@ -454,7 +454,7 @@ pub fn detect_markers(
     };
     if wants_full_res_refine(p) {
         let full_params = full_res_params(p);
-        detections.par_iter_mut().for_each(|d| refine_full_resolution(gray, d, &full_params));
+        detections.par_iter_mut().for_each(|d| refine_full_resolution(gray, d, dict, &full_params));
     }
     (detections, rejected)
 }
@@ -476,7 +476,13 @@ fn full_res_params(p: &DetectorParameters) -> DetectorParameters {
 
 /// Refit one decoded marker's outer border with the AprilTag quad fitter on a
 /// full-resolution crop, keeping the coarse corners if the fit fails.
-fn refine_full_resolution(gray: &GrayImage, detection: &mut Detection, full_params: &DetectorParameters) {
+fn refine_full_resolution(
+    gray: &GrayImage,
+    detection: &mut Detection,
+    dict: &Dictionary,
+    full_params: &DetectorParameters,
+) {
+    let modules = dict.marker_size + 2 * full_params.marker_border_bits.max(0) as usize;
     let (min_x, max_x) = detection.corners.iter().fold((f32::MAX, f32::MIN), |bounds, pt| {
         (bounds.0.min(pt.0), bounds.1.max(pt.0))
     });
@@ -488,7 +494,7 @@ fn refine_full_resolution(gray: &GrayImage, detection: &mut Detection, full_para
     }
     // The refit only looks at a band around the border; AprilTag's threshold needs
     // one 3x3 group of 4-pixel tiles (12 px) of context beyond it.
-    let margin = apriltag::border_band(&detection.corners).0 + 12.0;
+    let margin = apriltag::border_band(&detection.corners, modules, full_params.marker_border_bits).0 + 12.0;
     // Keep the crop origin on AprilTag's 4x4 threshold tile grid.
     let x0 = (((min_x - margin) / 4.0).floor() as i64 * 4)
         .clamp(0, gray.width() as i64) as u32;
@@ -503,7 +509,7 @@ fn refine_full_resolution(gray: &GrayImage, detection: &mut Detection, full_para
     }
     let crop = image::imageops::crop_imm(gray, x0, y0, x1 - x0, y1 - y0).to_image();
     let local = detection.corners.map(|pt| (pt.0 - x0 as f32, pt.1 - y0 as f32));
-    if let Some(corners) = apriltag::refit_quad(&crop, &local, full_params) {
+    if let Some(corners) = apriltag::refit_quad(&crop, &local, full_params, modules) {
         detection.corners = corners.map(|pt| (pt.0 + x0 as f32, pt.1 + y0 as f32));
     }
 }
@@ -533,7 +539,7 @@ pub fn detect_markers_multi(
             .par_iter_mut()
             .zip(grays.par_iter())
             .flat_map(|((dets, _), gray)| dets.par_iter_mut().map(move |d| (d, gray)))
-            .for_each(|(d, gray)| refine_full_resolution(gray, d, &full_params));
+            .for_each(|(d, gray)| refine_full_resolution(gray, d, dict, &full_params));
     }
     results
 }

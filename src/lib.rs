@@ -193,6 +193,14 @@ impl PyDetectorParameters {
         self.inner.april_tag_quad_decimate = v;
         Ok(())
     }
+    /// Refit decoded AprilTag quads in full-resolution crops when decimation exceeds 1.
+    /// A tag missed by the coarse search cannot be recovered by this pass.
+    #[getter]
+    fn april_tag_refine_full_resolution(&self) -> bool { self.inner.april_tag_refine_full_resolution }
+    #[setter]
+    fn set_april_tag_refine_full_resolution(&mut self, v: bool) {
+        self.inner.april_tag_refine_full_resolution = v;
+    }
     #[getter]
     fn april_tag_quad_sigma(&self) -> f64 { self.inner.april_tag_quad_sigma }
     #[setter]

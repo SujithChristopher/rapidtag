@@ -41,6 +41,7 @@ Construct with `DetectorParameters()`. These properties are writable:
 | `corner_refinement_max_iterations` | `int` | `30` |
 | `corner_refinement_min_accuracy` | `float` | `0.1` |
 | `april_tag_quad_decimate` | `float` | `0.0` |
+| `april_tag_refine_full_resolution` | `bool` | `False` |
 | `april_tag_quad_sigma` | `float` | `0.0` |
 | `april_tag_min_cluster_pixels` | `int` | `5` |
 | `april_tag_max_nmaxima` | `int` | `10` |
@@ -54,6 +55,12 @@ The module exports `CORNER_REFINE_NONE`, `CORNER_REFINE_SUBPIX`,
 Invalid methods and invalid corner refinement settings raise `ValueError`.
 `CORNER_REFINE_APRILTAG` selects AprilTag 2 quad candidate detection; see the
 [marker detection guide](marker-detection.md#detector-parameters).
+With `april_tag_quad_decimate > 1`, setting
+`april_tag_refine_full_resolution = True` searches full-resolution crops around
+decoded markers and replaces their corners when the same marker is found locally.
+The option has no effect without decimation and cannot recover a marker missed
+by the coarse full-frame search. If local refinement fails, the coarse corners
+are returned.
 
 ## ChArUco and chessboards
 

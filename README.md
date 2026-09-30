@@ -195,7 +195,8 @@ Supported dictionaries: all `DICT_{4,5,6,7}X{4,5,6,7}_{50,100,250,1000}`,
 Implemented:
 
 - ArUco / AprilTag marker detection with none, subpixel, contour, and
-  AprilTag 2 quad candidate modes
+  AprilTag 2 quad candidate modes, including decimated search with
+  full-resolution crop refinement
 - Generic chessboard detection with sub-pixel corners (`findChessboardCorners`)
 - ChArUco board detection using local marker homographies
 - Iterative PnP, RANSAC PnP, rigid-body multi-marker pose, Rodrigues, point projection,

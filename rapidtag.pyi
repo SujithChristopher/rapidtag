@@ -32,6 +32,7 @@ class DetectorParameters:
     corner_refinement_max_iterations: int
     corner_refinement_min_accuracy: float
     april_tag_quad_decimate: float
+    april_tag_refine_full_resolution: bool
     april_tag_quad_sigma: float
     april_tag_min_cluster_pixels: int
     april_tag_max_nmaxima: int

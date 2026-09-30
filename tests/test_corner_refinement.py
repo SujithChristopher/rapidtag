@@ -40,7 +40,7 @@ def test_corner_refinement_modes_detect_and_move_corners():
     cv_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_APRILTAG
     cv_corners, cv_ids, _ = cv2.aruco.ArucoDetector(dictionary, cv_params).detectMarkers(image)
     assert cv_ids.flatten().tolist() == [12]
-    assert np.max(np.abs(results["apriltag"] - cv_corners[0].reshape(4, 2))) < 3.0
+    assert np.max(np.abs(results["apriltag"] - cv_corners[0].reshape(4, 2))) < 1.0
 
     params = rapidtag.DetectorParameters()
     params.corner_refinement_method = rapidtag.CORNER_REFINE_APRILTAG
@@ -74,6 +74,73 @@ def test_apriltag_candidate_path_recovers_small_marker():
     assert cv_ids.flatten().tolist() == [12]
 
 
+def test_cropped_apriltag_refines_decimated_corners_and_batch():
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+    marker = cv2.aruco.generateImageMarker(dictionary, 12, 160)
+    source = np.float32([[0, 0], [159, 0], [159, 159], [0, 159]])
+    target = np.float32([[56, 44], [238, 61], [213, 235], [72, 202]])
+    image = cv2.warpPerspective(
+        marker, cv2.getPerspectiveTransform(source, target), (300, 280),
+        flags=cv2.INTER_LINEAR, borderValue=255,
+    )
+    image = cv2.GaussianBlur(image, (3, 3), 0.7)
+
+    full = rapidtag.DetectorParameters()
+    full.corner_refinement_method = rapidtag.CORNER_REFINE_APRILTAG
+    full_corners, full_ids = rapidtag.detect_markers(image, "DICT_APRILTAG_36h11", full)
+    assert full_ids == [12]
+
+    cropped = rapidtag.DetectorParameters()
+    assert cropped.april_tag_refine_full_resolution is False
+    cropped.corner_refinement_method = rapidtag.CORNER_REFINE_APRILTAG
+    cropped.april_tag_quad_decimate = 4.0
+    coarse_corners, coarse_ids = rapidtag.detect_markers(image, "DICT_APRILTAG_36h11", cropped)
+    assert coarse_ids == [12]
+    cropped.april_tag_refine_full_resolution = True
+    refined_corners, refined_ids = rapidtag.detect_markers(image, "DICT_APRILTAG_36h11", cropped)
+    assert refined_ids == [12]
+    assert np.max(np.abs(np.asarray(refined_corners) - np.asarray(full_corners))) < 0.05
+    assert np.max(np.abs(np.asarray(coarse_corners) - np.asarray(full_corners))) > 0.05
+
+    batch = rapidtag.detect_markers_batch([image, image], "DICT_APRILTAG_36h11", cropped)
+    assert [ids for _, ids in batch] == [[12], [12]]
+    assert np.allclose(batch[0][0], refined_corners)
+    assert np.allclose(batch[1][0], refined_corners)
+
+
+def test_crop_refinement_cannot_recover_tag_missed_by_coarse_search():
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+    marker = cv2.aruco.generateImageMarker(dictionary, 12, 28)
+    image = np.full((160, 160), 255, dtype=np.uint8)
+    image[65:93, 66:94] = marker
+    params = rapidtag.DetectorParameters()
+    params.corner_refinement_method = rapidtag.CORNER_REFINE_APRILTAG
+    params.april_tag_refine_full_resolution = True
+    params.april_tag_quad_decimate = 3.0
+    assert rapidtag.detect_markers(image, "DICT_APRILTAG_36h11", params)[1] == [12]
+    params.april_tag_quad_decimate = 4.0
+    assert rapidtag.detect_markers(image, "DICT_APRILTAG_36h11", params)[1] == []
+
+
+def test_crop_refinement_matches_multiple_marker_ids():
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+    image = np.full((280, 500), 255, dtype=np.uint8)
+    image[40:200, 30:190] = cv2.aruco.generateImageMarker(dictionary, 12, 160)
+    image[60:220, 300:460] = cv2.aruco.generateImageMarker(dictionary, 13, 160)
+    full = rapidtag.DetectorParameters()
+    full.corner_refinement_method = rapidtag.CORNER_REFINE_APRILTAG
+    full_corners, full_ids = rapidtag.detect_markers(image, "DICT_APRILTAG_36h11", full)
+    cropped = rapidtag.DetectorParameters()
+    cropped.corner_refinement_method = rapidtag.CORNER_REFINE_APRILTAG
+    cropped.april_tag_quad_decimate = 4.0
+    cropped.april_tag_refine_full_resolution = True
+    cropped_corners, cropped_ids = rapidtag.detect_markers(image, "DICT_APRILTAG_36h11", cropped)
+    assert set(cropped_ids) == set(full_ids) == {12, 13}
+    by_id = dict(zip(full_ids, full_corners))
+    for marker_id, corners in zip(cropped_ids, cropped_corners):
+        assert np.max(np.abs(np.asarray(corners) - by_id[marker_id])) < 0.05
+
+
 @pytest.mark.parametrize("decimate", [0.0, 2.0])
 def test_apriltag_quad_path_on_perspective_and_lighting(decimate):
     dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
@@ -100,4 +167,4 @@ def test_apriltag_quad_path_on_perspective_and_lighting(decimate):
     cv_params.aprilTagQuadDecimate = decimate
     cv_corners, cv_ids, _ = cv2.aruco.ArucoDetector(dictionary, cv_params).detectMarkers(image)
     assert cv_ids.flatten().tolist() == [12]
-    assert np.max(np.abs(np.asarray(corners[0]) - cv_corners[0].reshape(4, 2))) < 5.0
+    assert np.max(np.abs(np.asarray(corners[0]) - cv_corners[0].reshape(4, 2))) < 1.0

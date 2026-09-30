@@ -61,6 +61,27 @@ AprilTag-specific controls are `april_tag_quad_decimate` (default `0`, disabled)
 `april_tag_max_line_fit_mse` (`10`), `april_tag_min_white_black_diff` (`5`),
 and `april_tag_deglitch` (`False`). They affect the AprilTag candidate path only.
 
+For a faster search with full-resolution corner fitting on the markers found:
+
+```python
+parameters = rapidtag.DetectorParameters()
+parameters.corner_refinement_method = rapidtag.CORNER_REFINE_APRILTAG
+parameters.april_tag_quad_decimate = 3.0
+parameters.april_tag_refine_full_resolution = True
+corners, ids = rapidtag.detect_markers(image, "DICT_APRILTAG_36h11", parameters)
+```
+
+The coarse pass searches the entire frame; after decoding, the full-resolution
+AprilTag quad detector runs inside a padded crop around each found marker. The
+crop origin stays aligned with the detector's 4-pixel threshold tiles. If local
+detection fails, the decoded marker keeps its coarse corners. A marker missed
+by the coarse pass cannot be recovered by crop refinement. Larger decimation
+is faster but can miss small markers: in a 28-pixel generated-marker test,
+`3.0` detected the tag and `4.0` missed it. Use `0.0` for a full-resolution
+search when small-tag recall matters. Run `scripts/bench_cropped_apriltag.py`
+from the repository root to measure speed and corner agreement on the recorded
+stereo frames.
+
 ## Multiple cameras or frames
 
 Use one batch call rather than a Python thread per camera:

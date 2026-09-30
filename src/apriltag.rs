@@ -19,44 +19,60 @@ struct EdgePoint {
     gy: i32,
 }
 
+struct BoundaryEdge {
+    a: u32,
+    b: u32,
+    point: EdgePoint,
+}
+
 struct UnionFind {
-    parent: Vec<usize>,
-    size: Vec<usize>,
+    parent: Vec<u32>,
+    size: Vec<u32>,
 }
 
 impl UnionFind {
-    fn new(n: usize) -> Self {
+    fn new() -> Self {
         Self {
-            parent: (0..n).collect(),
-            size: vec![1; n],
+            parent: Vec::new(),
+            size: Vec::new(),
         }
     }
 
-    fn root(&mut self, mut i: usize) -> usize {
+    fn add(&mut self) -> u32 {
+        let label = self.parent.len() as u32;
+        self.parent.push(label);
+        self.size.push(1);
+        label
+    }
+
+    fn root(&mut self, mut i: u32) -> u32 {
         let mut r = i;
-        while self.parent[r] != r {
-            r = self.parent[r];
+        while self.parent[r as usize] != r {
+            r = self.parent[r as usize];
         }
-        while self.parent[i] != r {
-            let next = self.parent[i];
-            self.parent[i] = r;
+        while self.parent[i as usize] != r {
+            let next = self.parent[i as usize];
+            self.parent[i as usize] = r;
             i = next;
         }
         r
     }
 
-    fn connect(&mut self, a: usize, b: usize) {
+    fn connect(&mut self, a: u32, b: u32) {
+        if self.parent[a as usize] == self.parent[b as usize] {
+            return;
+        }
         let a = self.root(a);
         let b = self.root(b);
         if a == b {
             return;
         }
-        if self.size[a] > self.size[b] {
-            self.parent[b] = a;
-            self.size[a] += self.size[b];
+        if self.size[a as usize] > self.size[b as usize] {
+            self.parent[b as usize] = a;
+            self.size[a as usize] += self.size[b as usize];
         } else {
-            self.parent[a] = b;
-            self.size[b] += self.size[a];
+            self.parent[a as usize] = b;
+            self.size[b as usize] += self.size[a as usize];
         }
     }
 }
@@ -84,33 +100,29 @@ fn threshold(gray: &GrayImage, p: &DetectorParameters) -> Vec<u8> {
             }
         }
     }
-    let (mut expanded_lo, mut expanded_hi) = (vec![255u8; tw * th], vec![0u8; tw * th]);
     for ty in 0..th {
         for tx in 0..tw {
+            let (mut min, mut max) = (255u8, 0u8);
             for dy in -1i32..=1 {
                 for dx in -1i32..=1 {
                     let (nx, ny) = (tx as i32 + dx, ty as i32 + dy);
                     if nx >= 0 && nx < tw as i32 && ny >= 0 && ny < th as i32 {
                         let src_i = ny as usize * tw + nx as usize;
-                        let dst_i = ty * tw + tx;
-                        expanded_lo[dst_i] = expanded_lo[dst_i].min(lo[src_i]);
-                        expanded_hi[dst_i] = expanded_hi[dst_i].max(hi[src_i]);
+                        min = min.min(lo[src_i]);
+                        max = max.max(hi[src_i]);
                     }
                 }
             }
-        }
-    }
-    for y in 0..h {
-        for x in 0..w {
-            let ti = (y / 4).min(th - 1) * tw + (x / 4).min(tw - 1);
-            let min = expanded_lo[ti] as i32;
-            let max = expanded_hi[ti] as i32;
-            if max - min >= p.april_tag_min_white_black_diff {
-                out[y * w + x] = if src[y * w + x] as i32 > (max + min) / 2 {
-                    255
-                } else {
-                    0
-                };
+            if max as i32 - min as i32 >= p.april_tag_min_white_black_diff {
+                let cutoff = (max as i32 + min as i32) / 2;
+                let y_end = if ty + 1 == th { h } else { (ty + 1) * 4 };
+                let x_end = if tx + 1 == tw { w } else { (tx + 1) * 4 };
+                for y in ty * 4..y_end {
+                    for x in tx * 4..x_end {
+                        let i = y * w + x;
+                        out[i] = if src[i] as i32 > cutoff { 255 } else { 0 };
+                    }
+                }
             }
         }
     }
@@ -139,56 +151,74 @@ fn threshold(gray: &GrayImage, p: &DetectorParameters) -> Vec<u8> {
 }
 
 fn boundary_clusters(binary: &[u8], w: usize, h: usize, min_points: usize) -> Vec<Vec<EdgePoint>> {
-    let mut uf = UnionFind::new(w * h);
-    for y in 0..h.saturating_sub(1) {
-        for x in 1..w.saturating_sub(1) {
+    assert!(w * h < u32::MAX as usize);
+    let mut uf = UnionFind::new();
+    let mut labels = vec![u32::MAX; w * h];
+    let mut edges = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
             let i = y * w + x;
             let v = binary[i];
             if v == 127 {
                 continue;
             }
-            let neighbors: &[(isize, isize)] = if v == 255 {
-                &[(1, 0), (0, 1), (-1, 1), (1, 1)]
+
+            // Each horizontal run receives one label. The last row and first
+            // column have no horizontal outgoing links in AprilTag's graph.
+            let left_connected = y + 1 < h && x > 1 && binary[i - 1] == v;
+            labels[i] = if left_connected {
+                labels[i - 1]
             } else {
-                &[(1, 0), (0, 1)]
+                uf.add()
             };
-            for &(dx, dy) in neighbors {
-                let j = (y as isize + dy) as usize * w + (x as isize + dx) as usize;
-                if binary[j] == v {
-                    uf.connect(i, j);
+
+            // Reverse the original downward links. Only pixels in columns
+            // 1..w-1 on the preceding row can be their source.
+            if y > 0 {
+                let start = if v == 255 { x.saturating_sub(1) } else { x };
+                let end = if v == 255 { (x + 1).min(w - 1) } else { x };
+                // A continuing run has already visited the overlap with the
+                // preceding pixel's vertical neighborhood.
+                for nx in (if left_connected { end } else { start })..=end {
+                    if nx < 1 || nx + 1 >= w {
+                        continue;
+                    }
+                    let j = (y - 1) * w + nx;
+                    if binary[j] == v {
+                        if left_connected && nx > 0 && labels[j - 1] == labels[j] {
+                            continue;
+                        }
+                        uf.connect(labels[i], labels[j]);
+                    }
+                }
+            }
+
+            if y > 0 && y + 1 < h && x > 0 && x + 1 < w {
+                for (dx, dy) in [(1isize, 0isize), (0, 1), (-1, 1), (1, 1)] {
+                    let j = (y as isize + dy) as usize * w + (x as isize + dx) as usize;
+                    let other = binary[j];
+                    if v as u16 + other as u16 == 255 {
+                        edges.push(BoundaryEdge {
+                            a: i as u32,
+                            b: j as u32,
+                            point: EdgePoint {
+                                x2: 2 * x as i32 + dx as i32,
+                                y2: 2 * y as i32 + dy as i32,
+                                gx: dx as i32 * (other as i32 - v as i32),
+                                gy: dy as i32 * (other as i32 - v as i32),
+                            },
+                        });
+                    }
                 }
             }
         }
     }
-    let mut clusters: FxHashMap<(usize, usize), Vec<EdgePoint>> = FxHashMap::default();
-    for y in 1..h.saturating_sub(1) {
-        for x in 1..w.saturating_sub(1) {
-            let i = y * w + x;
-            let v0 = binary[i];
-            if v0 == 127 {
-                continue;
-            }
-            let rep0 = uf.root(i);
-            for (dx, dy) in [(1isize, 0isize), (0, 1), (-1, 1), (1, 1)] {
-                let j = (y as isize + dy) as usize * w + (x as isize + dx) as usize;
-                let v1 = binary[j];
-                if v0 as u16 + v1 as u16 != 255 {
-                    continue;
-                }
-                let rep1 = uf.root(j);
-                let key = if rep0 < rep1 {
-                    (rep0, rep1)
-                } else {
-                    (rep1, rep0)
-                };
-                clusters.entry(key).or_default().push(EdgePoint {
-                    x2: 2 * x as i32 + dx as i32,
-                    y2: 2 * y as i32 + dy as i32,
-                    gx: dx as i32 * (v1 as i32 - v0 as i32),
-                    gy: dy as i32 * (v1 as i32 - v0 as i32),
-                });
-            }
-        }
+    let mut clusters: FxHashMap<u64, Vec<EdgePoint>> = FxHashMap::default();
+    for edge in edges {
+        let rep0 = uf.root(labels[edge.a as usize]);
+        let rep1 = uf.root(labels[edge.b as usize]);
+        let key = ((rep0.min(rep1) as u64) << 32) | rep0.max(rep1) as u64;
+        clusters.entry(key).or_default().push(edge.point);
     }
     let mut ordered: Vec<_> = clusters.into_iter().collect();
     ordered.retain(|(_, points)| points.len() >= min_points);

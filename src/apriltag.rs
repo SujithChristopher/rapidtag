@@ -150,7 +150,9 @@ fn threshold(gray: &GrayImage, p: &DetectorParameters) -> Vec<u8> {
     out
 }
 
-fn boundary_clusters(binary: &[u8], w: usize, h: usize, min_points: usize) -> Vec<Vec<EdgePoint>> {
+/// Union-find over same-colour runs plus every black/white boundary edge, in
+/// raster order.
+fn boundary_edges(binary: &[u8], w: usize, h: usize) -> (UnionFind, Vec<u32>, Vec<BoundaryEdge>) {
     assert!(w * h < u32::MAX as usize);
     let mut uf = UnionFind::new();
     let mut labels = vec![u32::MAX; w * h];
@@ -213,17 +215,61 @@ fn boundary_clusters(binary: &[u8], w: usize, h: usize, min_points: usize) -> Ve
             }
         }
     }
+    (uf, labels, edges)
+}
+
+/// Cluster key of an edge: the unordered pair of components it separates.
+fn edge_key(uf: &mut UnionFind, labels: &[u32], edge: &BoundaryEdge) -> u64 {
+    let rep0 = uf.root(labels[edge.a as usize]);
+    let rep1 = uf.root(labels[edge.b as usize]);
+    ((rep0.min(rep1) as u64) << 32) | rep0.max(rep1) as u64
+}
+
+fn boundary_clusters(binary: &[u8], w: usize, h: usize, min_points: usize) -> Vec<Vec<EdgePoint>> {
+    let (mut uf, labels, edges) = boundary_edges(binary, w, h);
     let mut clusters: FxHashMap<u64, Vec<EdgePoint>> = FxHashMap::default();
     for edge in edges {
-        let rep0 = uf.root(labels[edge.a as usize]);
-        let rep1 = uf.root(labels[edge.b as usize]);
-        let key = ((rep0.min(rep1) as u64) << 32) | rep0.max(rep1) as u64;
+        let key = edge_key(&mut uf, &labels, &edge);
         clusters.entry(key).or_default().push(edge.point);
     }
     let mut ordered: Vec<_> = clusters.into_iter().collect();
     ordered.retain(|(_, points)| points.len() >= min_points);
     ordered.sort_unstable_by_key(|(key, _)| *key);
     ordered.into_iter().map(|(_, points)| points).collect()
+}
+
+/// The cluster of at least `min_points` edges with the most edges passing `near`,
+/// with that count — what `boundary_clusters` followed by a max over near-counts
+/// would pick (ties go to the larger key, as `max_by_key` over sorted keys does),
+/// without grouping every other cluster.
+fn best_cluster(
+    binary: &[u8],
+    w: usize,
+    h: usize,
+    min_points: usize,
+    near: impl Fn(&EdgePoint) -> bool,
+) -> Option<(usize, Vec<EdgePoint>)> {
+    let (mut uf, labels, edges) = boundary_edges(binary, w, h);
+    let keys: Vec<u64> = edges.iter().map(|e| edge_key(&mut uf, &labels, e)).collect();
+    let mut counts: FxHashMap<u64, (usize, usize)> = FxHashMap::default();
+    for (edge, &key) in edges.iter().zip(&keys) {
+        let c = counts.entry(key).or_default();
+        c.1 += 1;
+        if near(&edge.point) {
+            c.0 += 1;
+        }
+    }
+    let (best, (near_count, _)) = counts
+        .into_iter()
+        .filter(|(_, (_, total))| *total >= min_points)
+        .max_by(|(ka, (na, _)), (kb, (nb, _))| na.cmp(nb).then(ka.cmp(kb)))?;
+    let points = edges
+        .iter()
+        .zip(&keys)
+        .filter(|(_, &key)| key == best)
+        .map(|(edge, _)| edge.point)
+        .collect();
+    Some((near_count, points))
 }
 
 #[derive(Clone, Copy)]
@@ -242,13 +288,14 @@ struct LineFits {
 impl LineFits {
     fn new(points: &[EdgePoint], gray: &GrayImage) -> Self {
         let (w, h) = (gray.width() as i32, gray.height() as i32);
+        let raw = gray.as_raw();
         let mut prefix = Vec::with_capacity(points.len() + 1);
         prefix.push([0.0; 6]);
         for p in points {
             let (x, y) = (p.x2 as f64 * 0.5 + 0.5, p.y2 as f64 * 0.5 + 0.5);
             let (ix, iy) = (x.floor() as i32, y.floor() as i32);
             let weight = if ix > 0 && ix + 1 < w && iy > 0 && iy + 1 < h {
-                let px = |x: i32, y: i32| gray.get_pixel(x as u32, y as u32).0[0] as f64;
+                let px = |x: i32, y: i32| raw[(y * w + x) as usize] as f64;
                 (px(ix + 1, iy) - px(ix - 1, iy)).hypot(px(ix, iy + 1) - px(ix, iy - 1)) + 1.0
             } else {
                 1.0
@@ -265,6 +312,38 @@ impl LineFits {
             prefix.push(std::array::from_fn(|i| previous[i] + value[i]));
         }
         Self { prefix }
+    }
+
+    /// Fit error only (`Line::error`), from the smaller eigenvalue of the point
+    /// covariance in closed form — the same quantity `fit` gets via the normal
+    /// angle, without its atan2/sin/cos.
+    fn fit_error(&self, start: usize, end: usize) -> Option<f64> {
+        let n = self.prefix.len() - 1;
+        let count = if end >= start {
+            end - start + 1
+        } else {
+            n - start + end + 1
+        };
+        if count < 3 {
+            return None;
+        }
+        let (a, b) = (&self.prefix[start], &self.prefix[end + 1]);
+        let sums: [f64; 6] = if end >= start {
+            std::array::from_fn(|i| b[i] - a[i])
+        } else {
+            std::array::from_fn(|i| self.prefix[n][i] - a[i] + b[i])
+        };
+        if sums[0] <= 0.0 {
+            return None;
+        }
+        let (cx, cy) = (sums[1] / sums[0], sums[2] / sums[0]);
+        let (xx, xy, yy) = (
+            sums[3] / sums[0] - cx * cx,
+            sums[4] / sums[0] - cx * cy,
+            sums[5] / sums[0] - cy * cy,
+        );
+        let mse = (0.5 * (xx + yy - ((xx - yy) * (xx - yy) + 4.0 * xy * xy).sqrt())).max(0.0);
+        Some(mse * count as f64)
     }
 
     fn fit(&self, start: usize, end: usize) -> Option<Line> {
@@ -306,6 +385,19 @@ impl LineFits {
     }
 }
 
+/// A cheap stand-in for `dy.atan2(dx)` with the same ordering: strictly
+/// increasing in the angle, over (-2, 2] where atan2 covers (-pi, pi].
+fn pseudo_angle(dx: f64, dy: f64) -> f64 {
+    let d = if dy >= 0.0 {
+        if dx >= 0.0 { dy / (dx + dy) } else { 1.0 - dx / (dy - dx) }
+    } else if dx < 0.0 {
+        2.0 - dy / (-dx - dy)
+    } else {
+        3.0 + dx / (dx - dy)
+    };
+    if d > 2.0 { d - 4.0 } else { d }
+}
+
 fn intersection(a: Line, b: Line) -> Option<Pt> {
     let det = a.nx * b.ny - a.ny * b.nx;
     if det.abs() < 0.001 {
@@ -344,11 +436,14 @@ fn fit_quad(mut points: Vec<EdgePoint>, gray: &GrayImage, p: &DetectorParameters
     if polarity < 0.0 {
         return None;
     }
+    // The centre's fractional offsets keep every point off the axes and off each
+    // other's rays, so keys never tie except for duplicate points (deduped below,
+    // and interchangeable since only positions are used from here on).
     let mut angular: Vec<(f64, EdgePoint)> = points
         .into_iter()
-        .map(|q| ((q.y2 as f64 - cy).atan2(q.x2 as f64 - cx), q))
+        .map(|q| (pseudo_angle(q.x2 as f64 - cx, q.y2 as f64 - cy), q))
         .collect();
-    angular.sort_by(|a, b| a.0.total_cmp(&b.0));
+    angular.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
     points = angular.into_iter().map(|(_, q)| q).collect();
     points.dedup_by_key(|q| (q.x2, q.y2));
     let n = points.len();
@@ -360,7 +455,7 @@ fn fit_quad(mut points: Vec<EdgePoint>, gray: &GrayImage, p: &DetectorParameters
 
     let mut errors = vec![0.0; n];
     for i in 0..n {
-        errors[i] = fits.fit((i + n - k) % n, (i + k) % n)?.error;
+        errors[i] = fits.fit_error((i + n - k) % n, (i + k) % n)?;
     }
     let mut smooth = vec![0.0; n];
     let weights = [
@@ -526,22 +621,30 @@ pub fn refit_quad(
     let (outer, inner) = border_band(coarse, modules, p.marker_border_bits);
     let mut binary = threshold(gray, p);
     mask_outside_border_band(&mut binary, gray.width() as usize, coarse, outer, inner);
-    let clusters = boundary_clusters(
+    // Inner bit edges sit at least one module inside the outer border.
+    let tol = (0.5 * module_size(coarse, modules)).max(2.0);
+    // Per edge: start point, unit direction and length, for a band test that
+    // needs no square root per point.
+    let edges: [(f32, f32, f32, f32, f32); 4] = std::array::from_fn(|i| {
+        let (a, b) = (coarse[i], coarse[(i + 1) % 4]);
+        let len = (b.0 - a.0).hypot(b.1 - a.1).max(1e-6);
+        (a.0, a.1, (b.0 - a.0) / len, (b.1 - a.1) / len, len)
+    });
+    let near_border = |q: &EdgePoint| {
+        let (x, y) = (q.x2 as f32 * 0.5 + 0.5, q.y2 as f32 * 0.5 + 0.5);
+        edges.iter().any(|&(ax, ay, ux, uy, len)| {
+            let (dx, dy) = (x - ax, y - ay);
+            let along = dx * ux + dy * uy;
+            (dx * uy - dy * ux).abs() < tol && along > -tol && along < len + tol
+        })
+    };
+    let (near, border) = best_cluster(
         &binary,
         gray.width() as usize,
         gray.height() as usize,
         24usize.max(p.april_tag_min_cluster_pixels as usize),
-    );
-    // Inner bit edges sit at least one module inside the outer border.
-    let tol = (0.5 * module_size(coarse, modules)).max(2.0);
-    let near_border = |q: &EdgePoint| {
-        let (x, y) = (q.x2 as f32 * 0.5 + 0.5, q.y2 as f32 * 0.5 + 0.5);
-        (0..4).any(|i| segment_distance((x, y), coarse[i], coarse[(i + 1) % 4]) < tol)
-    };
-    let (near, border) = clusters
-        .into_iter()
-        .map(|points| (points.iter().filter(|q| near_border(q)).count(), points))
-        .max_by_key(|(near, _)| *near)?;
+        near_border,
+    )?;
     if near < 24 {
         return None;
     }
@@ -610,13 +713,3 @@ fn mask_outside_border_band(binary: &mut [u8], w: usize, coarse: &Quad, outer: f
     }
 }
 
-fn segment_distance(p: Pt, a: Pt, b: Pt) -> f32 {
-    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-    let len2 = dx * dx + dy * dy;
-    let t = if len2 > 0.0 {
-        (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    (p.0 - a.0 - t * dx).hypot(p.1 - a.1 - t * dy)
-}

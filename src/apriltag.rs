@@ -659,7 +659,19 @@ pub fn refit_quad(
             .sum::<f32>()
     };
     let rotation = (0..4).min_by(|&a, &b| cost(a).total_cmp(&cost(b)))?;
-    Some(std::array::from_fn(|i| quad[(i + rotation) % 4]))
+    let refit: Quad = std::array::from_fn(|i| quad[(i + rotation) % 4]);
+    // The coarse quad is already within a pixel or two of the truth, so a corner
+    // that moved further than that came from a line fitted to the wrong edge
+    // (an inner bit boundary, a neighbouring tag's border). Keep the coarse
+    // corners rather than hand back a confident wrong answer.
+    let max_move = (0.4 * module_size(coarse, modules)).max(3.0);
+    let moved = (0..4)
+        .map(|i| (refit[i].0 - coarse[i].0).hypot(refit[i].1 - coarse[i].1))
+        .fold(0.0f32, f32::max);
+    if moved > max_move {
+        return None;
+    }
+    Some(refit)
 }
 
 /// Longest side of `coarse` divided by the marker width in modules.

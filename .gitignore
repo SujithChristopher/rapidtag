@@ -12,3 +12,6 @@ target/
 /data/
 /graphify-out/
 /site/
+
+# Local website assets, benchmarks, and generation scripts
+/forwebsite/

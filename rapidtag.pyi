@@ -150,3 +150,49 @@ def estimate_pose_charuco_board(
     camera_matrix: _Matrix3,
     dist_coeffs: Optional[Sequence[float]] = None,
 ) -> Optional[tuple[list[float], list[float]]]: ...
+
+_Corners: TypeAlias = Sequence[_MarkerCorners] | NDArray[np.floating]
+_Ids: TypeAlias = Sequence[int] | NDArray[np.integer]
+
+def refine_edges(
+    image: _ImageU8,
+    corners: Optional[_Corners],
+    parallel: bool = False,
+) -> tuple[NDArray[np.float64], list[bool]]: ...
+def refine_grid(
+    image: _ImageU8,
+    corners: Optional[_Corners],
+    ids: Optional[_Ids],
+    dictionary: str = "DICT_APRILTAG_36h11",
+    fit_delta: bool = False,
+    outer_only: bool = False,
+    parallel: bool = False,
+) -> tuple[NDArray[np.float64], list[bool]]: ...
+def pattern_score(
+    image: _ImageU8,
+    corners: _MarkerCorners | NDArray[np.floating],
+    marker_id: int,
+    dictionary: str = "DICT_APRILTAG_36h11",
+) -> float: ...
+
+class MultiStageRefiner:
+    def __init__(
+        self,
+        dictionary: str = "DICT_APRILTAG_36h11",
+        marker_ids: Optional[Sequence[int]] = None,
+        max_gap: int = 4,
+        min_score: float = 0.7,
+        box_margin: float = 3.0,
+        grid: bool = True,
+        fit_delta: bool = False,
+        parallel: bool = False,
+    ) -> None: ...
+    def refine(
+        self,
+        image: _ImageU8,
+        corners: Optional[_Corners],
+        ids: Optional[_Ids],
+        sample: int,
+        offset: tuple[float, float] = (0.0, 0.0),
+    ) -> tuple[NDArray[np.float64], list[int], list[int]]: ...
+    def reset(self) -> None: ...

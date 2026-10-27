@@ -26,6 +26,25 @@ impl Dictionary {
         (self.marker_size * self.marker_size + 7) / 8
     }
 
+    /// Bits of marker `id` in its normal rotation, row-major (`marker_size`^2),
+    /// 1 = white; mirrors Dictionary::getBitsFromByteList.
+    pub fn marker_bits(&self, id: usize) -> Option<Vec<u8>> {
+        let row = self.bytes_list.get(id)?;
+        let total = self.marker_size * self.marker_size;
+        let mut bits = vec![0u8; total];
+        let (mut byte, mut bit) = (0usize, 0usize);
+        for b in bits.iter_mut() {
+            *b = (row[byte] >> (7 - bit)) & 1;
+            bit += 1;
+            if bit == 8 {
+                byte += 1;
+                // the last byte holds only the remaining bits, in its low positions
+                bit = if 8 * (byte + 1) > total { 8 * (byte + 1) - total } else { 0 };
+            }
+        }
+        Some(bits)
+    }
+
     /// Identify a marker from its per-cell white-pixel ratios (row-major, len = markerSize^2).
     /// Returns (marker id, rotation 0..4) or None.
     pub fn identify(

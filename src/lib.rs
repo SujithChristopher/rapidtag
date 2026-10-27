@@ -16,6 +16,9 @@ mod contours;
 mod corner_refine;
 mod cornersubpix;
 mod detector;
+mod edge_refine;
+mod grid_refine;
+mod multistage;
 #[allow(non_upper_case_globals)]
 mod dictionaries_data;
 
@@ -29,9 +32,10 @@ mod pnp;
 mod rigid_body;
 
 use detector::DetectorParameters;
-use numpy::PyReadonlyArrayDyn;
+use numpy::{IntoPyArray, PyArray3, PyReadonlyArray3, PyReadonlyArrayDyn};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use rayon::prelude::*;
 
 /// Detector parameters for marker detection. `corner_refinement_method` accepts
 /// `CORNER_REFINE_NONE`, `CORNER_REFINE_SUBPIX`, `CORNER_REFINE_CONTOUR`, or
@@ -978,6 +982,240 @@ fn _corner_sub_pix(
         .collect())
 }
 
+// ---------------------------------------------------------------------------
+// Multistage refinement (edge + track + grid), ported from NOARK's tracker.
+
+type QuadF64 = grid_refine::QuadF64;
+
+/// Pixels of a 2D (or HxWx1) uint8 image, borrowed when C-contiguous.
+fn gray_pixels<'a>(arr: &'a PyReadonlyArrayDyn<u8>) -> PyResult<(std::borrow::Cow<'a, [u8]>, usize, usize)> {
+    let (h, w) = match arr.as_array().shape() {
+        [h, w] | [h, w, 1] => (*h, *w),
+        _ => return Err(PyValueError::new_err("image must be a 2D grayscale uint8 array")),
+    };
+    let pix = match arr.as_slice() {
+        Ok(s) => std::borrow::Cow::Borrowed(s),
+        Err(_) => std::borrow::Cow::Owned(arr.as_array().iter().copied().collect()),
+    };
+    Ok((pix, w, h))
+}
+
+/// Marker corners from anything numpy reads as N x 4 x 2 (detectMarkers' tuple of
+/// 1x4x2 arrays, rapidtag's nested lists, an array); None or empty gives none.
+fn quads(corners: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<QuadF64>> {
+    let Some(corners) = corners else { return Ok(Vec::new()) };
+    let np = corners.py().import_bound("numpy")?;
+    let arr = np.call_method1("asarray", (corners, "float64"))?;
+    if arr.getattr("size")?.extract::<usize>()? == 0 {
+        return Ok(Vec::new());
+    }
+    let arr: PyReadonlyArray3<f64> = arr.call_method1("reshape", (-1i64, 4i64, 2i64))?.extract()?;
+    let v = arr.as_array();
+    Ok((0..v.shape()[0]).map(|i| std::array::from_fn(|k| (v[[i, k, 0]], v[[i, k, 1]]))).collect())
+}
+
+/// Marker ids from a list or detectMarkers' N x 1 array; None gives none.
+fn id_list(ids: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<i32>> {
+    let Some(ids) = ids else { return Ok(Vec::new()) };
+    let np = ids.py().import_bound("numpy")?;
+    let v: Vec<i64> = np
+        .call_method1("asarray", (ids, "int64"))?
+        .call_method0("ravel")?
+        .call_method0("tolist")?
+        .extract()?;
+    Ok(v.into_iter().map(|i| i as i32).collect())
+}
+
+fn quads_to_py<'py>(py: Python<'py>, qs: &[QuadF64]) -> Bound<'py, PyArray3<f64>> {
+    let flat: Vec<f64> = qs.iter().flat_map(|q| q.iter().flat_map(|p| [p.0, p.1])).collect();
+    ndarray::Array3::from_shape_vec((qs.len(), 4, 2), flat)
+        .expect("N x 4 x 2")
+        .into_pyarray_bound(py)
+}
+
+fn quad_f32(q: &QuadF64) -> edge_refine::Quad {
+    std::array::from_fn(|i| (q[i].0 as f32, q[i].1 as f32))
+}
+
+fn quad_f64(q: &edge_refine::Quad) -> QuadF64 {
+    std::array::from_fn(|i| (q[i].0 as f64, q[i].1 as f64))
+}
+
+fn get_dict(name: &str) -> PyResult<dictionary::Dictionary> {
+    dictionary::get_predefined_dictionary(name)
+        .ok_or_else(|| PyValueError::new_err(format!("unknown dictionary: {name}")))
+}
+
+fn get_pattern(dict: &dictionary::Dictionary, id: i32) -> PyResult<grid_refine::Pattern> {
+    let bits = usize::try_from(id)
+        .ok()
+        .and_then(|i| dict.marker_bits(i))
+        .ok_or_else(|| PyValueError::new_err(format!("marker id {id} not in dictionary")))?;
+    Ok(grid_refine::Pattern::new(&bits, dict.marker_size))
+}
+
+/// Edge refinement: each outer edge placed at the halfway grey-level crossing,
+/// corners = intersections of the edges. `corners` is anything numpy reads as
+/// N x 4 x 2 (detectMarkers output works as is).
+///
+/// Returns `(corners, ok)`: an N x 4 x 2 float64 array and, per tag, whether the
+/// refinement held (a tag that failed keeps its input corners). `parallel` spreads
+/// the tags over the rayon pool.
+#[pyfunction]
+#[pyo3(signature = (image, corners, parallel=false))]
+fn refine_edges<'py>(
+    py: Python<'py>,
+    image: PyReadonlyArrayDyn<'py, u8>,
+    corners: Option<&Bound<'py, PyAny>>,
+    parallel: bool,
+) -> PyResult<(Bound<'py, PyArray3<f64>>, Vec<bool>)> {
+    let qs = quads(corners)?;
+    let (pix, w, h) = gray_pixels(&image)?;
+    let img = edge_refine::GrayView { data: &pix, w, h };
+    let edge = |q: &QuadF64| {
+        let (e, ok) = edge_refine::refine_tag(&img, &quad_f32(q));
+        (quad_f64(&e), ok)
+    };
+    let (out, ok): (Vec<QuadF64>, Vec<bool>) = py.allow_threads(|| {
+        if parallel { qs.par_iter().map(edge).unzip() } else { qs.iter().map(edge).unzip() }
+    });
+    Ok((quads_to_py(py, &out), ok))
+}
+
+/// Grid refinement: one homography per tag fitted to every black/white transition
+/// of its bit pattern (outer edges and interior cell boundaries). Start from
+/// refined corners (e.g. `refine_edges`).
+///
+/// Returns `(corners, ok)`; a tag whose fit was rejected keeps its input corners.
+/// `parallel` spreads the tags over the rayon pool.
+#[pyfunction]
+#[pyo3(signature = (image, corners, ids, dictionary="DICT_APRILTAG_36h11", fit_delta=false, outer_only=false, parallel=false))]
+fn refine_grid<'py>(
+    py: Python<'py>,
+    image: PyReadonlyArrayDyn<'py, u8>,
+    corners: Option<&Bound<'py, PyAny>>,
+    ids: Option<&Bound<'py, PyAny>>,
+    dictionary: &str,
+    fit_delta: bool,
+    outer_only: bool,
+    parallel: bool,
+) -> PyResult<(Bound<'py, PyArray3<f64>>, Vec<bool>)> {
+    let qs = quads(corners)?;
+    let ids = id_list(ids)?;
+    if ids.len() != qs.len() {
+        return Err(PyValueError::new_err("corners and ids differ in length"));
+    }
+    let dict = get_dict(dictionary)?;
+    let pats = ids.iter().map(|&i| get_pattern(&dict, i)).collect::<PyResult<Vec<_>>>()?;
+    let (pix, w, h) = gray_pixels(&image)?;
+    let img = edge_refine::GrayView { data: &pix, w, h };
+    let grid = |(q, pat): (&QuadF64, &grid_refine::Pattern)| {
+        let (g, info) = grid_refine::refine_tag(&img, q, pat, fit_delta, outer_only);
+        (g, info.ok)
+    };
+    let (out, ok): (Vec<QuadF64>, Vec<bool>) = py.allow_threads(|| {
+        if parallel { qs.par_iter().zip(&pats).map(grid).unzip() } else { qs.iter().zip(&pats).map(grid).unzip() }
+    });
+    Ok((quads_to_py(py, &out), ok))
+}
+
+/// Correlation between the grey levels at a tag's cell centres (through its
+/// corners' homography) and its bit pattern: ~1 for the right tag in the right
+/// orientation, ~0 otherwise, -1 when a cell centre falls outside the image.
+#[pyfunction]
+#[pyo3(signature = (image, corners, marker_id, dictionary="DICT_APRILTAG_36h11"))]
+fn pattern_score(
+    image: PyReadonlyArrayDyn<'_, u8>,
+    corners: &Bound<'_, PyAny>,
+    marker_id: i32,
+    dictionary: &str,
+) -> PyResult<f64> {
+    let qs = quads(Some(corners))?;
+    let [q] = qs.as_slice() else {
+        return Err(PyValueError::new_err("expected one tag's 4 x 2 corners"));
+    };
+    let pat = get_pattern(&get_dict(dictionary)?, marker_id)?;
+    let (pix, w, h) = gray_pixels(&image)?;
+    Ok(grid_refine::pattern_score(&edge_refine::GrayView { data: &pix, w, h }, q, &pat))
+}
+
+/// Multistage corner refinement for one camera (keep one per camera): edge
+/// refinement, a track layer that re-finds tags the detector missed from their
+/// predicted corners, then grid refinement. `parallel` refines a frame's tags on
+/// the rayon pool.
+#[pyclass(name = "MultiStageRefiner")]
+struct PyMultiStageRefiner {
+    inner: multistage::MultiStage,
+}
+
+#[pymethods]
+impl PyMultiStageRefiner {
+    #[new]
+    #[pyo3(signature = (
+        dictionary="DICT_APRILTAG_36h11",
+        marker_ids=None,
+        max_gap=4,
+        min_score=0.7,
+        box_margin=3.0,
+        grid=true,
+        fit_delta=false,
+        parallel=false
+    ))]
+    fn new(
+        dictionary: &str,
+        marker_ids: Option<Vec<i32>>,
+        max_gap: i64,
+        min_score: f64,
+        box_margin: f64,
+        grid: bool,
+        fit_delta: bool,
+        parallel: bool,
+    ) -> PyResult<Self> {
+        let params = multistage::Params { max_gap, min_score, box_margin, grid, fit_delta, parallel };
+        Ok(Self { inner: multistage::MultiStage::new(get_dict(dictionary)?, marker_ids, params) })
+    }
+
+    /// Refine one frame's detections. `sample` is the frame number (track gaps are
+    /// counted in it); `offset` is the image's (x, y) origin in the full frame when
+    /// it is a moving crop.
+    ///
+    /// Returns `(corners, ids, how)` for the kept tags sorted by id: corners
+    /// N x 4 x 2 float64 in `image` pixels, how 0 = detected, 1 = re-found by the
+    /// track layer.
+    #[pyo3(signature = (image, corners, ids, sample, offset=(0.0, 0.0)))]
+    fn refine<'py>(
+        &mut self,
+        py: Python<'py>,
+        image: PyReadonlyArrayDyn<'py, u8>,
+        corners: Option<&Bound<'py, PyAny>>,
+        ids: Option<&Bound<'py, PyAny>>,
+        sample: i64,
+        offset: (f64, f64),
+    ) -> PyResult<(Bound<'py, PyArray3<f64>>, Vec<i32>, Vec<u8>)> {
+        let qs = quads(corners)?;
+        let ids = id_list(ids)?;
+        if ids.len() != qs.len() {
+            return Err(PyValueError::new_err("corners and ids differ in length"));
+        }
+        let dets: Vec<(i32, edge_refine::Quad)> = ids.iter().zip(&qs).map(|(&i, q)| (i, quad_f32(q))).collect();
+        let (pix, w, h) = gray_pixels(&image)?;
+        let img = edge_refine::GrayView { data: &pix, w, h };
+        let inner = &mut self.inner;
+        let out = py.allow_threads(|| inner.refine(&img, &dets, sample, offset));
+        let corners: Vec<QuadF64> = out.iter().map(|t| t.corners).collect();
+        Ok((
+            quads_to_py(py, &corners),
+            out.iter().map(|t| t.id).collect(),
+            out.iter().map(|t| t.how as u8).collect(),
+        ))
+    }
+
+    /// Forget all tracks (e.g. after a pause in the frame stream).
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+}
+
 #[pymodule]
 fn rapidtag(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // On big.LITTLE ARM, pin the detect worker pool to the fast cores before
@@ -991,6 +1229,7 @@ fn rapidtag(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCharucoBoard>()?;
     m.add_class::<PyRigidBody>()?;
     m.add_class::<PyRigidBodyPose>()?;
+    m.add_class::<PyMultiStageRefiner>()?;
     m.add_function(wrap_pyfunction!(detect_markers, m)?)?;
     m.add_function(wrap_pyfunction!(detect_markers_batch, m)?)?;
     m.add_function(wrap_pyfunction!(detect_charuco_board, m)?)?;
@@ -1004,5 +1243,8 @@ fn rapidtag(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rodrigues, m)?)?;
     m.add_function(wrap_pyfunction!(estimate_pose_charuco_board, m)?)?;
     m.add_function(wrap_pyfunction!(_charuco_predict, m)?)?;
+    m.add_function(wrap_pyfunction!(refine_edges, m)?)?;
+    m.add_function(wrap_pyfunction!(refine_grid, m)?)?;
+    m.add_function(wrap_pyfunction!(pattern_score, m)?)?;
     Ok(())
 }

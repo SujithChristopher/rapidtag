@@ -70,6 +70,48 @@ all markers in all frames of a batch. It applies in two cases:
 The refit cannot recover a marker missed by the coarse full-frame search. If
 the refit fails, the coarse corners are returned.
 
+## Multistage corner refinement
+
+Edge, track, and grid refinement after detection, ported from the NOARK
+tracker. Use them on corners from any detector (rapidtag or OpenCV:
+`corners` accepts anything NumPy reads as `N x 4 x 2`, including
+`cv2.aruco` output, and `ids` accepts an `N x 1` array). Images must be 2D
+`uint8`. Each returns corners as an `N x 4 x 2` `float64` array; a tag whose
+refinement fails keeps its input corners. `parallel=True` spreads a call's tags
+over the Rayon pool; on the Radxa Q6A the dispatch costs more than it saves for
+a few tags, so it is off by default.
+
+### `refine_edges(image, corners, parallel=False)`
+
+Places each outer edge at the halfway grey-level crossing between the black
+border and the white margin (32 profiles per edge, a coarse search first when
+the edge lies outside the fine window) and returns the intersections. Returns
+`(corners, ok)`.
+
+### `refine_grid(image, corners, ids, dictionary="DICT_APRILTAG_36h11", fit_delta=False, outer_only=False, parallel=False)`
+
+Fits one homography per tag to every black/white transition of its bit pattern,
+interior cell boundaries included. Start from refined corners (for example
+`refine_edges`). `fit_delta` also fits the print bleed; `outer_only` uses the
+four outer edges only. Returns `(corners, ok)`.
+
+### `pattern_score(image, corners, marker_id, dictionary="DICT_APRILTAG_36h11")`
+
+Correlation between the grey levels at the tag's cell centres and its bit
+pattern: about 1 for the right tag in the right orientation, about 0 otherwise,
+`-1` when a cell centre falls outside the image.
+
+### `MultiStageRefiner(dictionary="DICT_APRILTAG_36h11", marker_ids=None, max_gap=4, min_score=0.7, box_margin=3.0, grid=True, fit_delta=False, parallel=False)`
+
+Stateful refinement for one camera; keep one per camera. `refine(image,
+corners, ids, sample, offset=(0.0, 0.0))` edge-refines the detections (a tag
+whose edges fail counts as missed), re-finds tags seen in the last `max_gap`
+samples from their constant-velocity predicted corners (accepted when the edges
+are found and `pattern_score >= min_score`), then grid-refines every kept tag.
+`offset` is the image's origin in the full frame when it is a moving crop.
+Returns `(corners, ids, how)` sorted by id, with `how` 0 = detected and 1 =
+re-found. `reset()` forgets the tracks.
+
 ## ChArUco and chessboards
 
 ### `CharucoBoard(squares_x, squares_y, square_length, marker_length, dictionary, ids=None, legacy_pattern=False)`
